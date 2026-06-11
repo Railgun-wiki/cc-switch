@@ -9,7 +9,7 @@
 
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
-use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
+use crate::proxy::usage::calculator::CostCalculator;
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
     get_sync_state, metadata_modified_nanos, update_sync_state, SessionSyncResult,
@@ -276,7 +276,6 @@ fn sync_single_antigravity_file(
                     tokens.cache_creation,
                     content_str
                 );
-                use sha2::{Digest, Sha256};
                 let hash_val = Sha256::digest(hash_input.as_bytes());
                 format!("hash_{:x}", hash_val)
             }
