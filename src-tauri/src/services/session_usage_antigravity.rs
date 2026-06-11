@@ -87,6 +87,14 @@ impl<'a> ProtoParser<'a> {
                 let value = self.decode_varint()?;
                 Some((field_num, ProtoValue::Varint(value)))
             }
+            1 => {
+                // Fixed64 - skip 8 bytes
+                if self.offset + 8 > self.data.len() {
+                    return None;
+                }
+                self.offset += 8;
+                self.next_field()
+            }
             2 => {
                 // Length-delimited
                 let length = self.decode_varint()? as usize;
@@ -271,9 +279,12 @@ fn sync_single_antigravity_db(db: &Database, db_path: &Path) -> Result<(u32, u32
         return Ok((0, 0));
     }
 
-    // 使用 rusqlite 打开 Antigravity 的数据库
-    let antigravity_conn = rusqlite::Connection::open(db_path)
-        .map_err(|e| AppError::Config(format!("无法打开 Antigravity DB: {e}")))?;
+    // 使用 rusqlite 只读打开 Antigravity 的数据库，防止锁冲突
+    let antigravity_conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| AppError::Config(format!("无法打开 Antigravity DB: {e}")))?;
 
     // 读取 trajectory_metadata_blob 获取会话元数据
     let trajectory_meta = read_trajectory_metadata(&antigravity_conn);
