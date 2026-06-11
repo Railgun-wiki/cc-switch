@@ -280,11 +280,9 @@ fn sync_single_antigravity_db(db: &Database, db_path: &Path) -> Result<(u32, u32
     }
 
     // 使用 rusqlite 只读打开 Antigravity 的数据库，防止锁冲突
-    let antigravity_conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| AppError::Config(format!("无法打开 Antigravity DB: {e}")))?;
+    let antigravity_conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| AppError::Config(format!("无法打开 Antigravity DB: {e}")))?;
 
     // 读取 trajectory_metadata_blob 获取会话元数据
     let trajectory_meta = read_trajectory_metadata(&antigravity_conn);
