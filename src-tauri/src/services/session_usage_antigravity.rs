@@ -16,6 +16,7 @@ use crate::services::session_usage::{
 };
 use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
 use rust_decimal::Decimal;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,79 @@ struct AntigravityTokens {
     output: u32,
     cached: u32,
     thoughts: u32,
+    cache_creation: u32,
+}
+
+fn get_model_from_env(dir: &Path) -> Option<String> {
+    let env_path = dir.join(".env");
+    if !env_path.is_file() {
+        return None;
+    }
+    let file = fs::File::open(env_path).ok()?;
+    let reader = BufReader::new(file);
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if let Some((key, val)) = trimmed.split_once('=') {
+            let key = key.trim();
+            if key == "GEMINI_MODEL"
+                || key == "CLAUDE_MODEL"
+                || key == "MODEL"
+                || key == "API_MODEL"
+            {
+                let val = val.trim().trim_matches(|c| c == '"' || c == '\'');
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn get_model_from_json(path: &Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let val: serde_json::Value = serde_json::from_reader(file).ok()?;
+    val.get("model")
+        .or_else(|| val.pointer("/env/GEMINI_MODEL"))
+        .or_else(|| val.pointer("/env/CLAUDE_MODEL"))
+        .or_else(|| val.pointer("/env/MODEL"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn get_model_from_env_or_config(session_dir: &Path) -> Option<String> {
+    if let Some(m) = get_model_from_env(session_dir) {
+        return Some(m);
+    }
+    if let Some(m) = get_model_from_json(&session_dir.join("settings.json")) {
+        return Some(m);
+    }
+
+    if let Some(root) = session_dir.parent().and_then(|p| p.parent()) {
+        if let Some(m) = get_model_from_env(root) {
+            return Some(m);
+        }
+        if let Some(m) = get_model_from_json(&root.join("settings.json")) {
+            return Some(m);
+        }
+    }
+
+    let global_dir = crate::antigravity_config::get_antigravity_dir();
+    if let Some(m) = get_model_from_json(&global_dir.join("settings.json")) {
+        return Some(m);
+    }
+
+    None
 }
 
 /// 同步 Antigravity 使用数据（从 transcript.jsonl）
@@ -125,17 +199,19 @@ fn sync_single_antigravity_file(
         fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
     let reader = BufReader::new(file);
 
+    let session_dir = file_path
+        .parent() // logs
+        .and_then(|p| p.parent()) // .system_generated
+        .and_then(|p| p.parent()); // <session_id>
+
+    let mut current_model = session_dir.and_then(get_model_from_env_or_config);
+
     let mut line_offset: i64 = 0;
     let mut imported: u32 = 0;
     let mut skipped: u32 = 0;
 
     for line_result in reader.lines() {
         line_offset += 1;
-
-        // 跳过已处理的行
-        if line_offset <= last_offset {
-            continue;
-        }
 
         let line = match line_result {
             Ok(l) => l,
@@ -151,6 +227,15 @@ fn sync_single_antigravity_file(
             Err(_) => continue,
         };
 
+        if let Some(m) = value.get("model").and_then(|v| v.as_str()) {
+            current_model = Some(m.to_string());
+        }
+
+        // 跳过已处理的行
+        if line_offset <= last_offset {
+            continue;
+        }
+
         let source = value.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -165,21 +250,38 @@ fn sync_single_antigravity_file(
         };
 
         let tokens = parse_antigravity_tokens(tokens_val);
-        if tokens.input == 0 && tokens.output == 0 && tokens.thoughts == 0 && tokens.cached == 0 {
+        if tokens.input == 0
+            && tokens.output == 0
+            && tokens.thoughts == 0
+            && tokens.cached == 0
+            && tokens.cache_creation == 0
+        {
             continue; // 跳过空 Token 记录
         }
 
-        let model = value
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("gemini-2.5-pro");
+        let model = current_model.as_deref().unwrap_or("gpt-oss-120b");
         let timestamp = value.get("created_at").and_then(|v| v.as_str());
 
-        let step_index = value
-            .get("step_index")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(line_offset);
-        let request_id = format!("agy_session:{session_id}:{step_index}");
+        let step_index_str = match value.get("step_index").and_then(|v| v.as_i64()) {
+            Some(idx) => idx.to_string(),
+            None => {
+                let content_str = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let hash_input = format!(
+                    "ts:{:?}|in:{}|out:{}|cached:{}|thoughts:{}|cc:{}|content:{}",
+                    timestamp,
+                    tokens.input,
+                    tokens.output,
+                    tokens.cached,
+                    tokens.thoughts,
+                    tokens.cache_creation,
+                    content_str
+                );
+                use sha2::{Digest, Sha256};
+                let hash_val = Sha256::digest(hash_input.as_bytes());
+                format!("hash_{:x}", hash_val)
+            }
+        };
+        let request_id = format!("agy_session:{session_id}:{step_index_str}");
 
         match insert_antigravity_session_entry(
             db,
@@ -208,27 +310,45 @@ fn sync_single_antigravity_file(
 fn parse_antigravity_tokens(tokens: &serde_json::Value) -> AntigravityTokens {
     let input = tokens
         .get("input_tokens")
+        .or_else(|| tokens.get("inputTokens"))
         .or_else(|| tokens.get("input"))
+        .or_else(|| tokens.get("prompt_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
     let output = tokens
         .get("output_tokens")
+        .or_else(|| tokens.get("outputTokens"))
         .or_else(|| tokens.get("output"))
+        .or_else(|| tokens.get("completion_tokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
     let cached = tokens
-        .get("cache_read_input_tokens")
-        .or_else(|| tokens.get("cache_read_tokens"))
+        .get("cache_read_tokens")
+        .or_else(|| tokens.get("cacheReadTokens"))
+        .or_else(|| tokens.get("cache_read_input_tokens"))
         .or_else(|| tokens.get("cached"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
-    let thoughts = tokens.get("thoughts").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let thoughts = tokens
+        .get("thinking_output_tokens")
+        .or_else(|| tokens.get("thoughts_token_count"))
+        .or_else(|| tokens.get("thoughtsTokenCount"))
+        .or_else(|| tokens.get("thoughts"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let cache_creation = tokens
+        .get("cache_creation_input_tokens")
+        .or_else(|| tokens.get("cache_creation_tokens"))
+        .or_else(|| tokens.get("cache_creation"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
 
     AntigravityTokens {
         input,
         output,
         cached,
         thoughts,
+        cache_creation,
     }
 }
 
@@ -256,8 +376,8 @@ fn insert_antigravity_session_entry(
                 .unwrap_or(0)
         });
 
-    // 合并 thoughts 到 output（思考 token 按输出计费）
-    let output_tokens = tokens.output + tokens.thoughts;
+    // 取 output 与 thoughts 中的最大值，避免重复计算 thoughts 并确保安全
+    let output_tokens = std::cmp::max(tokens.output, tokens.thoughts);
 
     let dedup_key = DedupKey {
         app_type: "antigravity",
@@ -265,7 +385,7 @@ fn insert_antigravity_session_entry(
         input_tokens: tokens.input,
         output_tokens,
         cache_read_tokens: tokens.cached,
-        cache_creation_tokens: 0,
+        cache_creation_tokens: tokens.cache_creation,
         created_at,
     };
     if should_skip_session_insert(&conn, request_id, &dedup_key)? {
@@ -277,7 +397,7 @@ fn insert_antigravity_session_entry(
         input_tokens: tokens.input,
         output_tokens,
         cache_read_tokens: tokens.cached,
-        cache_creation_tokens: 0,
+        cache_creation_tokens: tokens.cache_creation,
         model: Some(model.to_string()),
         message_id: None,
     };
@@ -318,6 +438,7 @@ fn insert_antigravity_session_entry(
             input_tokens = excluded.input_tokens,
             output_tokens = excluded.output_tokens,
             cache_read_tokens = excluded.cache_read_tokens,
+            cache_creation_tokens = excluded.cache_creation_tokens,
             input_cost_usd = excluded.input_cost_usd,
             output_cost_usd = excluded.output_cost_usd,
             cache_read_cost_usd = excluded.cache_read_cost_usd,
@@ -326,6 +447,7 @@ fn insert_antigravity_session_entry(
         WHERE input_tokens != excluded.input_tokens
            OR output_tokens != excluded.output_tokens
            OR cache_read_tokens != excluded.cache_read_tokens
+           OR cache_creation_tokens != excluded.cache_creation_tokens
            OR model != excluded.model",
         rusqlite::params![
             request_id,
@@ -336,7 +458,7 @@ fn insert_antigravity_session_entry(
             tokens.input,
             output_tokens,
             tokens.cached,
-            0i64,                // cache_creation_tokens
+            tokens.cache_creation, // cache_creation_tokens
             input_cost,
             output_cost,
             cache_read_cost,
@@ -373,13 +495,15 @@ mod tests {
             "input_tokens": 100,
             "output_tokens": 50,
             "cache_read_input_tokens": 20,
-            "thoughts": 10
+            "thoughts": 10,
+            "cache_creation_input_tokens": 15
         });
         let tokens = parse_antigravity_tokens(&json);
         assert_eq!(tokens.input, 100);
         assert_eq!(tokens.output, 50);
         assert_eq!(tokens.cached, 20);
         assert_eq!(tokens.thoughts, 10);
+        assert_eq!(tokens.cache_creation, 15);
 
         let json_short = serde_json::json!({
             "input": 200,
@@ -391,5 +515,20 @@ mod tests {
         assert_eq!(tokens_short.output, 80);
         assert_eq!(tokens_short.cached, 30);
         assert_eq!(tokens_short.thoughts, 0);
+        assert_eq!(tokens_short.cache_creation, 0);
+
+        let json_fallback = serde_json::json!({
+            "prompt_tokens": 120,
+            "completion_tokens": 60,
+            "cache_read_tokens": 25,
+            "thinking_output_tokens": 15,
+            "cache_creation_tokens": 5
+        });
+        let tokens_fallback = parse_antigravity_tokens(&json_fallback);
+        assert_eq!(tokens_fallback.input, 120);
+        assert_eq!(tokens_fallback.output, 60);
+        assert_eq!(tokens_fallback.cached, 25);
+        assert_eq!(tokens_fallback.thoughts, 15);
+        assert_eq!(tokens_fallback.cache_creation, 5);
     }
 }
