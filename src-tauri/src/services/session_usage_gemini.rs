@@ -24,6 +24,7 @@ use crate::services::session_usage::{
 use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
 use rust_decimal::Decimal;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -110,7 +111,9 @@ fn collect_gemini_session_files(gemini_dir: &Path) -> Vec<PathBuf> {
             let is_session = path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("session-") && n.ends_with(".json"))
+                .map(|n| {
+                    n.starts_with("session-") && (n.ends_with(".json") || n.ends_with(".jsonl"))
+                })
                 .unwrap_or(false);
             if is_session {
                 files.push(path);
@@ -121,7 +124,6 @@ fn collect_gemini_session_files(gemini_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// 同步单个 Gemini 会话 JSON 文件，返回 (imported, skipped)
 fn sync_single_gemini_file(db: &Database, file_path: &Path) -> Result<(u32, u32), AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
 
@@ -131,85 +133,177 @@ fn sync_single_gemini_file(db: &Database, file_path: &Path) -> Result<(u32, u32)
     let file_modified = metadata_modified_nanos(&metadata);
 
     // 检查同步状态
-    let (last_modified, _last_offset) = get_sync_state(db, &file_path_str)?;
+    let (last_modified, last_offset) = get_sync_state(db, &file_path_str)?;
 
     // 文件未变化则跳过
     if file_modified <= last_modified {
         return Ok((0, 0));
     }
 
-    // 读取并解析整个 JSON 文件
-    let content = fs::read_to_string(file_path)
-        .map_err(|e| AppError::Config(format!("无法读取文件: {e}")))?;
-    let value: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| AppError::Config(format!("JSON 解析失败: {e}")))?;
-
-    // 提取顶层 sessionId
-    let session_id = value
-        .get("sessionId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    // 遍历 messages 数组
-    let messages = match value.get("messages").and_then(|v| v.as_array()) {
-        Some(msgs) => msgs,
-        None => return Ok((0, 0)),
-    };
+    let is_jsonl = file_path.extension().and_then(|e| e.to_str()) == Some("jsonl");
 
     let mut imported: u32 = 0;
     let mut skipped: u32 = 0;
-    let mut gemini_msg_count: i64 = 0;
 
-    for msg in messages {
-        // 只处理 type == "gemini" 的消息
-        if msg.get("type").and_then(|t| t.as_str()) != Some("gemini") {
-            continue;
-        }
+    if is_jsonl {
+        // 从上次偏移位置开始增量解析 JSONL
+        let file = fs::File::open(file_path)
+            .map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
+        let reader = BufReader::new(file);
 
-        // 提取 tokens 对象
-        let tokens_obj = match msg.get("tokens") {
-            Some(t) if t.is_object() => t,
-            _ => continue,
-        };
+        let mut line_offset: i64 = 0;
+        let mut session_id: Option<String> = None;
 
-        let tokens = parse_gemini_tokens(tokens_obj);
-        if tokens.input == 0 && tokens.output == 0 && tokens.thoughts == 0 && tokens.cached == 0 {
-            continue; // 跳过全零的空 token 消息
-        }
+        for line_result in reader.lines() {
+            line_offset += 1;
 
-        gemini_msg_count += 1;
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => continue, // 容忍不完整的最后一行
+            };
 
-        // 提取消息 ID 和模型
-        let message_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let model = msg
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let timestamp = msg.get("timestamp").and_then(|v| v.as_str());
+            if line.trim().is_empty() {
+                continue;
+            }
 
-        // 生成唯一 request_id
-        let session_id_str = session_id.as_deref().unwrap_or("unknown");
-        let request_id = format!("gemini_session:{session_id_str}:{message_id}");
+            let msg: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
 
-        match insert_gemini_session_entry(
-            db,
-            &request_id,
-            &tokens,
-            model,
-            session_id.as_deref(),
-            timestamp,
-        ) {
-            Ok(true) => imported += 1,
-            Ok(false) => skipped += 1,
-            Err(e) => {
-                log::warn!("[GEMINI-SYNC] 插入失败 ({}): {e}", request_id);
-                skipped += 1;
+            // 提取 sessionId (可以从任一行含有 sessionId 的记录中提取)
+            if session_id.is_none() {
+                if let Some(sid) = msg.get("sessionId").and_then(|v| v.as_str()) {
+                    session_id = Some(sid.to_string());
+                }
+            }
+
+            // 跳过已处理 of 行
+            if line_offset <= last_offset {
+                continue;
+            }
+
+            // 只处理 type == "gemini" 的消息
+            if msg.get("type").and_then(|t| t.as_str()) != Some("gemini") {
+                continue;
+            }
+
+            // 提取 tokens 对象
+            let tokens_obj = match msg.get("tokens") {
+                Some(t) if t.is_object() => t,
+                _ => continue,
+            };
+
+            let tokens = parse_gemini_tokens(tokens_obj);
+            if tokens.input == 0 && tokens.output == 0 && tokens.thoughts == 0 && tokens.cached == 0
+            {
+                continue; // 跳过全零的空 token 消息
+            }
+
+            // 提取消息 ID 和模型
+            let message_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let model = msg
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let timestamp = msg.get("timestamp").and_then(|v| v.as_str());
+
+            // 生成唯一 request_id
+            let session_id_str = session_id.as_deref().unwrap_or("unknown");
+            let request_id = format!("gemini_session:{session_id_str}:{message_id}");
+
+            match insert_gemini_session_entry(
+                db,
+                &request_id,
+                &tokens,
+                model,
+                session_id.as_deref(),
+                timestamp,
+            ) {
+                Ok(true) => imported += 1,
+                Ok(false) => skipped += 1,
+                Err(e) => {
+                    log::warn!("[GEMINI-SYNC] 插入失败 ({}): {e}", request_id);
+                    skipped += 1;
+                }
             }
         }
-    }
 
-    // 更新同步状态
-    update_sync_state(db, &file_path_str, file_modified, gemini_msg_count)?;
+        // 更新同步状态
+        update_sync_state(db, &file_path_str, file_modified, line_offset)?;
+    } else {
+        // 保留原有的 JSON 全量解析逻辑作为 fallback
+        let content = fs::read_to_string(file_path)
+            .map_err(|e| AppError::Config(format!("无法读取文件: {e}")))?;
+        let value: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| AppError::Config(format!("JSON 解析失败: {e}")))?;
+
+        // 提取顶层 sessionId
+        let session_id = value
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // 遍历 messages 数组
+        let messages = match value.get("messages").and_then(|v| v.as_array()) {
+            Some(msgs) => msgs,
+            None => return Ok((0, 0)),
+        };
+
+        let mut gemini_msg_count: i64 = 0;
+
+        for msg in messages {
+            // 只处理 type == "gemini" 的消息
+            if msg.get("type").and_then(|t| t.as_str()) != Some("gemini") {
+                continue;
+            }
+
+            // 提取 tokens 对象
+            let tokens_obj = match msg.get("tokens") {
+                Some(t) if t.is_object() => t,
+                _ => continue,
+            };
+
+            let tokens = parse_gemini_tokens(tokens_obj);
+            if tokens.input == 0 && tokens.output == 0 && tokens.thoughts == 0 && tokens.cached == 0
+            {
+                continue; // 跳过全零的空 token 消息
+            }
+
+            gemini_msg_count += 1;
+
+            // 提取消息 ID 和模型
+            let message_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let model = msg
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let timestamp = msg.get("timestamp").and_then(|v| v.as_str());
+
+            // 生成唯一 request_id
+            let session_id_str = session_id.as_deref().unwrap_or("unknown");
+            let request_id = format!("gemini_session:{session_id_str}:{message_id}");
+
+            match insert_gemini_session_entry(
+                db,
+                &request_id,
+                &tokens,
+                model,
+                session_id.as_deref(),
+                timestamp,
+            ) {
+                Ok(true) => imported += 1,
+                Ok(false) => skipped += 1,
+                Err(e) => {
+                    log::warn!("[GEMINI-SYNC] 插入失败 ({}): {e}", request_id);
+                    skipped += 1;
+                }
+            }
+        }
+
+        // 更新同步状态
+        update_sync_state(db, &file_path_str, file_modified, gemini_msg_count)?;
+    }
 
     Ok((imported, skipped))
 }
