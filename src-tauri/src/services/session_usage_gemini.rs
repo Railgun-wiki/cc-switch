@@ -24,7 +24,8 @@ use crate::services::session_usage::{
     get_sync_state, metadata_modified_nanos, update_sync_state, SessionSyncResult,
 };
 use crate::services::usage_stats::{
-    find_model_pricing, is_placeholder_pricing_model, should_skip_session_insert, DedupKey,
+    find_model_pricing, has_matching_proxy_usage_log, is_placeholder_pricing_model,
+    should_skip_session_insert, DedupKey,
 };
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -382,6 +383,7 @@ fn find_gemini_pricing(conn: &rusqlite::Connection, model_id: &str) -> Option<Mo
 }
 
 const ANTIGRAVITY_ROOTS: [&str; 3] = ["antigravity", "antigravity-cli", "antigravity-ide"];
+const ANTIGRAVITY_RUNNING_STATUS: i64 = 2;
 
 #[derive(Debug)]
 enum ProtoValue {
@@ -530,6 +532,16 @@ struct GenMetadataEntry {
     token_data: Option<AntigravityTokenData>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct AntigravityStepState {
+    timestamp: Option<i64>,
+}
+
+struct AntigravityStepStates {
+    by_gen_idx: HashMap<i64, AntigravityStepState>,
+    has_running_step: bool,
+}
+
 fn collect_antigravity_db_files(gemini_dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for root in ANTIGRAVITY_ROOTS {
@@ -576,13 +588,15 @@ fn sync_single_antigravity_db(db: &Database, db_path: &Path) -> Result<(u32, u32
     .map_err(|e| AppError::Config(format!("无法只读打开 Antigravity DB: {e}")))?;
 
     let trajectory_meta = read_trajectory_metadata(&agy_conn);
+    let step_states = read_step_states(&agy_conn);
     let gen_entries = read_gen_metadata_entries(&agy_conn);
     if gen_entries.is_empty() {
-        update_sync_state(db, &file_path_str, file_modified, 0)?;
+        if !step_states.has_running_step {
+            update_sync_state(db, &file_path_str, file_modified, 0)?;
+        }
         return Ok((0, 0));
     }
 
-    let step_timestamps = read_step_timestamps(&agy_conn);
     let session_id = trajectory_meta
         .as_ref()
         .and_then(|meta| meta.session_id.clone())
@@ -599,6 +613,7 @@ fn sync_single_antigravity_db(db: &Database, db_path: &Path) -> Result<(u32, u32
 
     let mut imported = 0u32;
     let mut skipped = 0u32;
+    let mut has_sync_errors = false;
     let max_idx = gen_entries.last().map(|entry| entry.idx + 1).unwrap_or(0);
 
     for entry in &gen_entries {
@@ -611,9 +626,10 @@ fn sync_single_antigravity_db(db: &Database, db_path: &Path) -> Result<(u32, u32
 
         let session_id_str = session_id.as_deref().unwrap_or("unknown");
         let request_id = format!("gemini_antigravity_session:{session_id_str}:{}", entry.idx);
-        let created_at = step_timestamps
+        let created_at = step_states
+            .by_gen_idx
             .get(&entry.idx)
-            .copied()
+            .and_then(|state| state.timestamp)
             .unwrap_or(fallback_created_at);
 
         match insert_antigravity_session_entry(
@@ -628,11 +644,14 @@ fn sync_single_antigravity_db(db: &Database, db_path: &Path) -> Result<(u32, u32
             Err(e) => {
                 log::warn!("[GEMINI-SYNC] 插入 Antigravity 会话失败 ({request_id}): {e}");
                 skipped += 1;
+                has_sync_errors = true;
             }
         }
     }
 
-    update_sync_state(db, &file_path_str, file_modified, max_idx)?;
+    if !step_states.has_running_step && !has_sync_errors {
+        update_sync_state(db, &file_path_str, file_modified, max_idx)?;
+    }
     Ok((imported, skipped))
 }
 
@@ -687,30 +706,57 @@ fn read_gen_metadata_entries(conn: &rusqlite::Connection) -> Vec<GenMetadataEntr
     entries
 }
 
-fn read_step_timestamps(conn: &rusqlite::Connection) -> HashMap<i64, i64> {
-    let mut map = HashMap::new();
-    let mut stmt = match conn.prepare("SELECT metadata FROM steps WHERE metadata IS NOT NULL") {
+fn read_step_states(conn: &rusqlite::Connection) -> AntigravityStepStates {
+    let mut by_gen_idx = HashMap::new();
+    let mut has_running_step = false;
+    let mut stmt = match conn.prepare("SELECT status, metadata FROM steps") {
         Ok(stmt) => stmt,
-        Err(_) => return map,
+        Err(_) => {
+            return AntigravityStepStates {
+                by_gen_idx,
+                has_running_step,
+            }
+        }
     };
-    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0)).ok();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+        })
+        .ok();
     if let Some(rows) = rows {
         for row in rows.flatten() {
-            if let Some((gen_idx, timestamp)) = parse_step_timestamp(&row) {
-                map.entry(gen_idx)
-                    .and_modify(|existing| {
-                        if timestamp < *existing {
-                            *existing = timestamp;
+            let (status, metadata) = row;
+            if status == ANTIGRAVITY_RUNNING_STATUS {
+                has_running_step = true;
+            }
+            let Some(metadata) = metadata else {
+                continue;
+            };
+            if let Some((gen_idx, timestamp)) = parse_step_metadata(&metadata) {
+                by_gen_idx
+                    .entry(gen_idx)
+                    .and_modify(|state: &mut AntigravityStepState| {
+                        if state
+                            .timestamp
+                            .map(|existing| timestamp < existing)
+                            .unwrap_or(true)
+                        {
+                            state.timestamp = Some(timestamp);
                         }
                     })
-                    .or_insert(timestamp);
+                    .or_insert(AntigravityStepState {
+                        timestamp: Some(timestamp),
+                    });
             }
         }
     }
-    map
+    AntigravityStepStates {
+        by_gen_idx,
+        has_running_step,
+    }
 }
 
-fn parse_step_timestamp(data: &[u8]) -> Option<(i64, i64)> {
+fn parse_step_metadata(data: &[u8]) -> Option<(i64, i64)> {
     let mut parser = ProtoParser::new(data);
     let mut timestamp: Option<i64> = None;
     let mut gen_idx: Option<i64> = None;
@@ -852,7 +898,7 @@ fn insert_antigravity_session_entry(
         cache_creation_tokens: 0,
         created_at,
     };
-    if should_skip_session_insert(&conn, request_id, &dedup_key)? {
+    if has_matching_proxy_usage_log(&conn, &dedup_key)? {
         return Ok(false);
     }
 
@@ -1088,6 +1134,202 @@ mod tests {
         let should_skip =
             tokens.input == 0 && tokens.output == 0 && tokens.thoughts == 0 && tokens.cached == 0;
         assert!(!should_skip, "纯缓存命中记录不应被跳过");
+    }
+
+    fn proto_varint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn proto_varint_field(field: u32, value: u64) -> Vec<u8> {
+        let mut out = proto_varint(((field as u64) << 3) | 0);
+        out.extend(proto_varint(value));
+        out
+    }
+
+    fn proto_len_field(field: u32, payload: Vec<u8>) -> Vec<u8> {
+        let mut out = proto_varint(((field as u64) << 3) | 2);
+        out.extend(proto_varint(payload.len() as u64));
+        out.extend(payload);
+        out
+    }
+
+    fn step_metadata(gen_idx: i64, timestamp: i64) -> Vec<u8> {
+        let ts = proto_varint_field(1, timestamp as u64);
+        let gen_ref = proto_varint_field(3, gen_idx as u64);
+        let mut out = proto_len_field(1, ts);
+        out.extend(proto_len_field(20, gen_ref));
+        out
+    }
+
+    #[test]
+    fn test_read_step_states_only_status_two_protects_running() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE steps (status INTEGER, metadata BLOB);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO steps VALUES (?1, ?2), (?3, ?4)",
+            rusqlite::params![6, step_metadata(1, 100), 7, step_metadata(2, 200)],
+        )
+        .unwrap();
+
+        let states = read_step_states(&conn);
+        assert!(!states.has_running_step);
+        assert_eq!(
+            states.by_gen_idx.get(&1).and_then(|s| s.timestamp),
+            Some(100)
+        );
+        assert_eq!(
+            states.by_gen_idx.get(&2).and_then(|s| s.timestamp),
+            Some(200)
+        );
+
+        conn.execute(
+            "INSERT INTO steps VALUES (?1, ?2)",
+            rusqlite::params![ANTIGRAVITY_RUNNING_STATUS, step_metadata(3, 300)],
+        )
+        .unwrap();
+        let states = read_step_states(&conn);
+        assert!(states.has_running_step);
+        assert_eq!(
+            states.by_gen_idx.get(&3).and_then(|s| s.timestamp),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn test_sync_antigravity_db_does_not_advance_while_running() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agy.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path)
+                .map_err(|e| AppError::Database(format!("open fixture db: {e}")))?;
+            conn.execute_batch(
+                "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE steps (status INTEGER NOT NULL DEFAULT 0, metadata BLOB);",
+            )
+            .map_err(|e| AppError::Database(format!("create fixture schema: {e}")))?;
+            conn.execute(
+                "INSERT INTO steps VALUES (?1, ?2)",
+                rusqlite::params![ANTIGRAVITY_RUNNING_STATUS, step_metadata(1, 100)],
+            )
+            .map_err(|e| AppError::Database(format!("insert fixture step: {e}")))?;
+        }
+
+        let db = Database::memory()?;
+        let (imported, skipped) = sync_single_antigravity_db(&db, &db_path)?;
+        assert_eq!((imported, skipped), (0, 0));
+
+        let key = db_path.to_string_lossy().to_string();
+        let (last_modified, last_offset) = get_sync_state(&db, &key)?;
+        assert_eq!((last_modified, last_offset), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_antigravity_db_advances_for_canceled_or_failed_steps() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agy.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path)
+                .map_err(|e| AppError::Database(format!("open fixture db: {e}")))?;
+            conn.execute_batch(
+                "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE steps (status INTEGER NOT NULL DEFAULT 0, metadata BLOB);",
+            )
+            .map_err(|e| AppError::Database(format!("create fixture schema: {e}")))?;
+            conn.execute(
+                "INSERT INTO steps VALUES (?1, ?2), (?3, ?4)",
+                rusqlite::params![6, step_metadata(1, 100), 7, step_metadata(2, 200)],
+            )
+            .map_err(|e| AppError::Database(format!("insert fixture steps: {e}")))?;
+        }
+
+        let db = Database::memory()?;
+        let (imported, skipped) = sync_single_antigravity_db(&db, &db_path)?;
+        assert_eq!((imported, skipped), (0, 0));
+
+        let key = db_path.to_string_lossy().to_string();
+        let (last_modified, last_offset) = get_sync_state(&db, &key)?;
+        assert!(last_modified > 0);
+        assert_eq!(last_offset, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_antigravity_session_entry_upserts_existing_request() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let request_id = "gemini-antigravity-session-upsert";
+        let first = AntigravityTokenData {
+            input_tokens: 10,
+            output_tokens: 2,
+            cached_tokens: 1,
+            thoughts_tokens: 0,
+            model: "gemini-3-pro-b".to_string(),
+        };
+        assert!(insert_antigravity_session_entry(
+            &db,
+            request_id,
+            &first,
+            Some("agy-session"),
+            1000,
+        )?);
+
+        let second = AntigravityTokenData {
+            input_tokens: 20,
+            output_tokens: 3,
+            cached_tokens: 2,
+            thoughts_tokens: 7,
+            model: "gemini-3-flash-a-thinking".to_string(),
+        };
+        assert!(insert_antigravity_session_entry(
+            &db,
+            request_id,
+            &second,
+            Some("agy-session"),
+            2000,
+        )?);
+
+        let conn = lock_conn!(db.conn);
+        let row: (i64, i64, i64, String, String, i64) = conn.query_row(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, model, pricing_model, created_at
+             FROM proxy_request_logs WHERE request_id = ?1",
+            rusqlite::params![request_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            row,
+            (
+                20,
+                7,
+                2,
+                "gemini-3-flash-a-thinking".to_string(),
+                "gemini-3-flash-preview".to_string(),
+                2000
+            )
+        );
+
+        Ok(())
     }
 
     #[test]
