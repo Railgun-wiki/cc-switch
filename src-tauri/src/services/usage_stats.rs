@@ -207,6 +207,7 @@ fn provider_name_coalesce(log_alias: &str, provider_alias: &str) -> String {
          WHEN '_session' THEN 'Claude (Session)' \
          WHEN '_codex_session' THEN 'Codex (Session)' \
          WHEN '_gemini_session' THEN 'Gemini (Session)' \
+         WHEN '_gemini_antigravity_session' THEN 'Antigravity (Session)' \
          WHEN '_opencode_session' THEN 'OpenCode (Session)' \
          ELSE {log_alias}.provider_id END)"
     )
@@ -291,9 +292,11 @@ fn push_provider_model_filters(
 pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
     let data_source = data_source_expr(log_alias);
     let proxy_data_source = data_source_expr("proxy_dedup");
+    let effective_model = effective_model_sql(log_alias);
+    let proxy_effective_model = effective_model_sql("proxy_dedup");
     format!(
         "NOT (
-            {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'opencode_session')
+            {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'antigravity_session', 'opencode_session')
             AND EXISTS (
                 SELECT 1
                 FROM proxy_request_logs proxy_dedup
@@ -308,7 +311,7 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
                       proxy_dedup.cache_creation_tokens = {log_alias}.cache_creation_tokens
                       OR (
                           {log_alias}.cache_creation_tokens = 0
-                          AND {data_source} IN ('codex_session', 'gemini_session', 'opencode_session')
+                          AND {data_source} IN ('codex_session', 'gemini_session', 'antigravity_session', 'opencode_session')
                       )
                   )
                   AND proxy_dedup.created_at BETWEEN
@@ -316,8 +319,13 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
                       AND {log_alias}.created_at + {SESSION_PROXY_DEDUP_WINDOW_SECONDS}
                   AND (
                       LOWER(proxy_dedup.model) = LOWER({log_alias}.model)
+                      OR LOWER({proxy_effective_model}) = LOWER({log_alias}.model)
+                      OR LOWER(proxy_dedup.model) = LOWER({effective_model})
+                      OR LOWER({proxy_effective_model}) = LOWER({effective_model})
                       OR LOWER(proxy_dedup.model) = 'unknown'
+                      OR LOWER({proxy_effective_model}) = 'unknown'
                       OR LOWER({log_alias}.model) = 'unknown'
+                      OR LOWER({effective_model}) = 'unknown'
                   )
             )
         )"
@@ -371,6 +379,7 @@ pub(crate) fn has_matching_proxy_usage_log(
         matches!(key.app_type, "codex" | "gemini" | "opencode") && key.cache_creation_tokens == 0;
 
     let l_data_source = data_source_expr("l");
+    let l_effective_model = effective_model_sql("l");
     let sql = format!(
         "SELECT EXISTS (
             SELECT 1
@@ -386,7 +395,9 @@ pub(crate) fn has_matching_proxy_usage_log(
               AND l.created_at BETWEEN ?7 - ?8 AND ?7 + ?8
               AND (
                   LOWER(l.model) = LOWER(?2)
+                  OR LOWER({l_effective_model}) = LOWER(?2)
                   OR LOWER(l.model) = 'unknown'
+                  OR LOWER({l_effective_model}) = 'unknown'
                   OR LOWER(?2) = 'unknown'
               )
         )"
@@ -1989,7 +2000,57 @@ fn log_pricing_scope_matches(log: &RequestLogDetail, target_candidates: &[String
 
 pub(crate) fn is_placeholder_pricing_model(model_id: &str) -> bool {
     let normalized = model_id.trim().to_ascii_lowercase();
-    normalized.is_empty() || matches!(normalized.as_str(), "unknown" | "null" | "none")
+    normalized.is_empty()
+        || matches!(normalized.as_str(), "unknown" | "null" | "none")
+        || normalized.starts_with("model_placeholder_")
+}
+
+/// 解析 Antigravity 平台级的模型占位符 (Placeholder ID) 或物理模型 ID (Physical ID)
+/// 使得其回退到占位符/物理别名时，能够正确解析为项目中已存在的对应计费模型 (Billing Model)。
+///
+/// 映射关系如下：
+/// | 占位符 ID (Placeholder ID)      | 物理模型 ID (Physical ID)     | 对应项目中已有的计费模型 (Billing Model) |
+/// | :------------------------------ | :--------------------------- | :------------------------------------- |
+/// | `MODEL_PLACEHOLDER_M187`        | `gemini-default`              | `gemini-3.5-flash`                     |
+/// | `MODEL_PLACEHOLDER_M20`         | `gemini-default`              | `gemini-3.5-flash`                     |
+/// | `MODEL_PLACEHOLDER_M132`        | `gemini-3-flash-a`           | `gemini-3.5-flash`                     |
+/// | `MODEL_PLACEHOLDER_M36`         | `gemini-3.1-pro-low`         | `gemini-3.1-pro-preview`               |
+/// | `MODEL_PLACEHOLDER_M16`         | `gemini-pro-default`         | `gemini-3.1-pro-preview`               |
+/// | `MODEL_PLACEHOLDER_M35`         | `claude-sonnet-4-6`          | `claude-sonnet-4-6-20260217`           |
+/// | `MODEL_PLACEHOLDER_M26`         | `claude-opus-4-6-thinking`   | `claude-opus-4-6-20260206`             |
+/// | 无占位符/通用/未知平台占位符    | -                            | `unknown` (如 `model_placeholder_m999`) |
+/// | -                               | `gpt-oss-120b-medium`        | `gpt-oss-120b-medium`                  |
+pub(crate) fn resolve_antigravity_pricing_placeholder(normalized: &str) -> Option<String> {
+    // 剥离 -thinking 后缀以防带有 thinking 标识的别名未被映射
+    let without_thinking = normalized.strip_suffix("-thinking").unwrap_or(normalized);
+    match without_thinking {
+        // Gemini 3.5 Flash 档别
+        "model_placeholder_m187" | "gemini-default" => Some("gemini-3.5-flash".to_string()),
+        "model_placeholder_m20" => Some("gemini-3.5-flash".to_string()),
+        "model_placeholder_m132" | "gemini-3-flash-a" => Some("gemini-3.5-flash".to_string()),
+
+        // Gemini 3.1 Pro 档别
+        "model_placeholder_m36" | "gemini-3.1-pro-low" => {
+            Some("gemini-3.1-pro-preview".to_string())
+        }
+        "model_placeholder_m16" | "gemini-pro-default" => {
+            Some("gemini-3.1-pro-preview".to_string())
+        }
+
+        // Claude 4.6 系列（Sonnet 和 Opus）
+        "model_placeholder_m35" | "claude-sonnet-4-6" => {
+            Some("claude-sonnet-4-6-20260217".to_string())
+        }
+        "model_placeholder_m26" | "claude-opus-4-6" => Some("claude-opus-4-6-20260206".to_string()),
+
+        // 显式传入的 GPT-OSS 120B (Medium) 物理模型
+        "gpt-oss-120b-medium" => Some("gpt-oss-120b-medium".to_string()),
+
+        // 兜底：如果无法识别模型，或者为通用占位符/未知平台占位符，统一作为 "unknown"
+        "unknown" | "null" | "none" | "" => Some("unknown".to_string()),
+        other if other.starts_with("model_placeholder_") => Some("unknown".to_string()),
+        _ => None,
+    }
 }
 
 fn query_model_pricing_exact(
@@ -2042,7 +2103,9 @@ fn query_model_pricing_prefix(
 }
 
 fn model_pricing_candidates(model_id: &str) -> Vec<String> {
-    let cleaned = clean_model_id_for_pricing(model_id);
+    let resolved = resolve_antigravity_pricing_placeholder(&model_id.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| model_id.to_string());
+    let cleaned = clean_model_id_for_pricing(&resolved);
     if is_placeholder_pricing_model(&cleaned) {
         return Vec::new();
     }
@@ -2318,6 +2381,7 @@ mod tests {
                 request_id TEXT PRIMARY KEY,
                 app_type TEXT NOT NULL,
                 model TEXT NOT NULL,
+                pricing_model TEXT,
                 input_tokens INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
                 cache_read_tokens INTEGER NOT NULL,
@@ -2374,6 +2438,68 @@ mod tests {
         };
         assert!(has_matching_proxy_usage_log(&conn, &key)?);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_matching_proxy_log_uses_effective_pricing_model() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        create_legacy_nullable_logs_table(&conn)?;
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, app_type, model, pricing_model, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, status_code, created_at, data_source
+            ) VALUES (
+                'antigravity-proxy', 'gemini', 'gemini-3-pro-b', 'gemini-3-pro-preview',
+                100, 20, 5, 0, 200, 1000, 'proxy'
+            )",
+            [],
+        )?;
+
+        let key = DedupKey {
+            app_type: "gemini",
+            model: "gemini-3-pro-preview",
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 5,
+            cache_creation_tokens: 0,
+            created_at: 1000,
+        };
+        assert!(has_matching_proxy_usage_log(&conn, &key)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_effective_filter_uses_proxy_pricing_model_for_session_dedup() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        create_legacy_nullable_logs_table(&conn)?;
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, app_type, model, pricing_model, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, status_code, created_at, data_source
+            ) VALUES
+                (
+                    'antigravity-proxy', 'gemini', 'gemini-3-pro-b', 'gemini-3-pro-preview',
+                    100, 20, 5, 0, 200, 1000, 'proxy'
+                ),
+                (
+                    'antigravity-session', 'gemini', 'gemini-3-pro-preview', NULL,
+                    100, 20, 5, 0, 200, 1030, 'antigravity_session'
+                )",
+            [],
+        )?;
+
+        let filter = effective_usage_log_filter("l");
+        let sql = format!(
+            "SELECT request_id FROM proxy_request_logs l WHERE {filter} ORDER BY request_id"
+        );
+        let rows = conn
+            .prepare(&sql)?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        assert_eq!(rows, vec!["antigravity-proxy".to_string()]);
         Ok(())
     }
 
@@ -3582,6 +3708,37 @@ mod tests {
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].provider_id, "_opencode_session");
         assert_eq!(stats[0].provider_name, "OpenCode (Session)");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_provider_stats_labels_antigravity_session_provider() -> Result<(), AppError> {
+        let db = Database::memory()?;
+
+        {
+            let conn = lock_conn!(db.conn);
+            insert_usage_log(
+                &conn,
+                "antigravity-session",
+                "gemini",
+                "_gemini_antigravity_session",
+                "gemini-3-pro-preview",
+                "antigravity_session",
+                1000,
+                100,
+                50,
+                0,
+                0,
+                200,
+                "0.01",
+            )?;
+        }
+
+        let stats = db.get_provider_stats(None, None, Some("gemini"), None, None)?;
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].provider_id, "_gemini_antigravity_session");
+        assert_eq!(stats[0].provider_name, "Antigravity (Session)");
 
         Ok(())
     }
