@@ -293,6 +293,7 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
     let data_source = data_source_expr(log_alias);
     let proxy_data_source = data_source_expr("proxy_dedup");
     let effective_model = effective_model_sql(log_alias);
+    let proxy_effective_model = effective_model_sql("proxy_dedup");
     format!(
         "NOT (
             {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'antigravity_session', 'opencode_session')
@@ -318,9 +319,13 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
                       AND {log_alias}.created_at + {SESSION_PROXY_DEDUP_WINDOW_SECONDS}
                   AND (
                       LOWER(proxy_dedup.model) = LOWER({log_alias}.model)
+                      OR LOWER({proxy_effective_model}) = LOWER({log_alias}.model)
                       OR LOWER(proxy_dedup.model) = LOWER({effective_model})
+                      OR LOWER({proxy_effective_model}) = LOWER({effective_model})
                       OR LOWER(proxy_dedup.model) = 'unknown'
+                      OR LOWER({proxy_effective_model}) = 'unknown'
                       OR LOWER({log_alias}.model) = 'unknown'
+                      OR LOWER({effective_model}) = 'unknown'
                   )
             )
         )"
@@ -374,6 +379,7 @@ pub(crate) fn has_matching_proxy_usage_log(
         matches!(key.app_type, "codex" | "gemini" | "opencode") && key.cache_creation_tokens == 0;
 
     let l_data_source = data_source_expr("l");
+    let l_effective_model = effective_model_sql("l");
     let sql = format!(
         "SELECT EXISTS (
             SELECT 1
@@ -389,7 +395,9 @@ pub(crate) fn has_matching_proxy_usage_log(
               AND l.created_at BETWEEN ?7 - ?8 AND ?7 + ?8
               AND (
                   LOWER(l.model) = LOWER(?2)
+                  OR LOWER({l_effective_model}) = LOWER(?2)
                   OR LOWER(l.model) = 'unknown'
+                  OR LOWER({l_effective_model}) = 'unknown'
                   OR LOWER(?2) = 'unknown'
               )
         )"
@@ -2378,6 +2386,68 @@ mod tests {
         };
         assert!(has_matching_proxy_usage_log(&conn, &key)?);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_matching_proxy_log_uses_effective_pricing_model() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        create_legacy_nullable_logs_table(&conn)?;
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, app_type, model, pricing_model, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, status_code, created_at, data_source
+            ) VALUES (
+                'antigravity-proxy', 'gemini', 'gemini-3-pro-b', 'gemini-3-pro-preview',
+                100, 20, 5, 0, 200, 1000, 'proxy'
+            )",
+            [],
+        )?;
+
+        let key = DedupKey {
+            app_type: "gemini",
+            model: "gemini-3-pro-preview",
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 5,
+            cache_creation_tokens: 0,
+            created_at: 1000,
+        };
+        assert!(has_matching_proxy_usage_log(&conn, &key)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_effective_filter_uses_proxy_pricing_model_for_session_dedup() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        create_legacy_nullable_logs_table(&conn)?;
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, app_type, model, pricing_model, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, status_code, created_at, data_source
+            ) VALUES
+                (
+                    'antigravity-proxy', 'gemini', 'gemini-3-pro-b', 'gemini-3-pro-preview',
+                    100, 20, 5, 0, 200, 1000, 'proxy'
+                ),
+                (
+                    'antigravity-session', 'gemini', 'gemini-3-pro-preview', NULL,
+                    100, 20, 5, 0, 200, 1030, 'antigravity_session'
+                )",
+            [],
+        )?;
+
+        let filter = effective_usage_log_filter("l");
+        let sql = format!(
+            "SELECT request_id FROM proxy_request_logs l WHERE {filter} ORDER BY request_id"
+        );
+        let rows = conn
+            .prepare(&sql)?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        assert_eq!(rows, vec!["antigravity-proxy".to_string()]);
         Ok(())
     }
 
