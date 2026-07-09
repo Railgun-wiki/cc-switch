@@ -563,11 +563,11 @@ impl SkillService {
         }
 
         let gemini_dir = crate::gemini_config::get_gemini_dir();
-        let mut dirs = vec![primary, gemini_dir.join("antigravity-cli").join("skills")];
-        let antigravity_dir = gemini_dir.join("antigravity");
-        if antigravity_dir.exists() {
-            dirs.push(antigravity_dir.join("skills"));
-        }
+        // Gemini CLI keeps its primary skills under ~/.gemini/skills/. For
+        // Antigravity-compatible Gemini skills, CC Switch only syncs
+        // ~/.gemini/config/skills/ and intentionally does not touch
+        // ~/.gemini/antigravity*/skills/.
+        let mut dirs = vec![primary, gemini_dir.join("config").join("skills")];
         dirs.sort();
         dirs.dedup();
         Ok(dirs)
@@ -1408,8 +1408,10 @@ impl SkillService {
         // 收集所有待扫描的目录及其来源标签
         let mut scan_sources: Vec<(PathBuf, String)> = Vec::new();
         for app in AppType::all() {
-            if let Ok(d) = Self::get_app_skills_dir(&app) {
-                scan_sources.push((d, app.as_str().to_string()));
+            if let Ok(dirs) = Self::get_app_skills_dirs(&app) {
+                for d in dirs {
+                    scan_sources.push((d, app.as_str().to_string()));
+                }
             }
         }
         if let Some(agents_dir) = get_agents_skills_dir() {
@@ -1479,8 +1481,10 @@ impl SkillService {
         // 收集所有候选搜索目录
         let mut search_sources: Vec<(PathBuf, String)> = Vec::new();
         for app in AppType::all() {
-            if let Ok(d) = Self::get_app_skills_dir(&app) {
-                search_sources.push((d, app.as_str().to_string()));
+            if let Ok(dirs) = Self::get_app_skills_dirs(&app) {
+                for d in dirs {
+                    search_sources.push((d, app.as_str().to_string()));
+                }
             }
         }
         if let Some(agents_dir) = get_agents_skills_dir() {
@@ -2364,13 +2368,15 @@ impl SkillService {
         }
 
         for app in AppType::all() {
-            let app_dir = match Self::get_app_skills_dir(&app) {
-                Ok(dir) => dir,
+            let app_dirs = match Self::get_app_skills_dirs(&app) {
+                Ok(dirs) => dirs,
                 Err(_) => continue,
             };
-            let candidate = app_dir.join(&skill.directory);
-            if candidate.is_dir() {
-                return Ok(Some(candidate));
+            for app_dir in app_dirs {
+                let candidate = app_dir.join(&skill.directory);
+                if candidate.is_dir() {
+                    return Ok(Some(candidate));
+                }
             }
         }
 
@@ -2990,44 +2996,46 @@ pub fn migrate_skills_to_ssot(db: &Arc<Database>) -> Result<usize> {
 
     // 扫描各应用目录
     for app in AppType::all() {
-        let app_dir = match SkillService::get_app_skills_dir(&app) {
-            Ok(d) => d,
+        let app_dirs = match SkillService::get_app_skills_dirs(&app) {
+            Ok(dirs) => dirs,
             Err(_) => continue,
         };
 
-        let entries = match fs::read_dir(&app_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        for app_dir in app_dirs {
+            let entries = match fs::read_dir(&app_dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
 
-            let dir_name = entry.file_name().to_string_lossy().to_string();
-            if dir_name.starts_with('.') {
-                continue;
-            }
-            if !path.join("SKILL.md").exists() {
-                continue;
-            }
-            if has_snapshot && !discovered.contains_key(&dir_name) {
-                continue;
-            }
+                let dir_name = entry.file_name().to_string_lossy().to_string();
+                if dir_name.starts_with('.') {
+                    continue;
+                }
+                if !path.join("SKILL.md").exists() {
+                    continue;
+                }
+                if has_snapshot && !discovered.contains_key(&dir_name) {
+                    continue;
+                }
 
-            // 复制到 SSOT（如果不存在）
-            let ssot_path = ssot_dir.join(&dir_name);
-            if !ssot_path.exists() {
-                SkillService::copy_dir_recursive(&path, &ssot_path)?;
-            }
+                // 复制到 SSOT（如果不存在）
+                let ssot_path = ssot_dir.join(&dir_name);
+                if !ssot_path.exists() {
+                    SkillService::copy_dir_recursive(&path, &ssot_path)?;
+                }
 
-            if !has_snapshot {
-                discovered
-                    .entry(dir_name)
-                    .or_default()
-                    .set_enabled_for(&app, true);
+                if !has_snapshot {
+                    discovered
+                        .entry(dir_name)
+                        .or_default()
+                        .set_enabled_for(&app, true);
+                }
             }
         }
     }
@@ -3144,5 +3152,21 @@ mod tests {
             dest.join("SKILL.md").is_file(),
             "existing destination skill should be preserved"
         );
+    }
+
+    #[test]
+    fn gemini_skills_dirs_include_only_cli_and_config_targets() {
+        let dirs =
+            SkillService::get_app_skills_dirs(&AppType::Gemini).expect("gemini dirs resolve");
+        let gemini_dir = crate::gemini_config::get_gemini_dir();
+
+        assert!(dirs.contains(&gemini_dir.join("skills")));
+        assert!(dirs.contains(&gemini_dir.join("config").join("skills")));
+        assert!(!dirs
+            .iter()
+            .any(|dir| dir.to_string_lossy().contains("antigravity-cli")));
+        assert!(!dirs
+            .iter()
+            .any(|dir| dir.to_string_lossy().contains("antigravity/skills")));
     }
 }
