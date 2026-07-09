@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::atomic_write;
 use crate::error::AppError;
-use crate::gemini_config::get_gemini_settings_path;
+use crate::gemini_config::{get_gemini_dir, get_gemini_settings_path};
 
 /// 获取 Gemini MCP 配置文件路径（~/.gemini/settings.json）
 fn user_config_path() -> PathBuf {
@@ -16,6 +16,9 @@ fn read_json_value(path: &Path) -> Result<Value, AppError> {
         return Ok(serde_json::json!({}));
     }
     let content = fs::read_to_string(path).map_err(|e| AppError::io(path, e))?;
+    if content.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
     let value: Value = serde_json::from_str(&content).map_err(|e| AppError::json(path, e))?;
     Ok(value)
 }
@@ -83,8 +86,29 @@ pub fn set_mcp_servers_map(
         serde_json::json!({})
     };
 
-    // 构建 mcpServers 对象：移除 UI 辅助字段（enabled/source），仅保留实际 MCP 规范
-    let mut out: Map<String, Value> = Map::new();
+    let out = build_gemini_mcp_servers_object(servers)?;
+    let antigravity_out = build_antigravity_mcp_servers_object(servers)?;
+
+    {
+        let obj = root
+            .as_object_mut()
+            .ok_or_else(|| AppError::Config("~/.gemini/settings.json 根必须是对象".into()))?;
+        obj.insert("mcpServers".into(), Value::Object(out));
+    }
+
+    write_json_value(&path, &root)?;
+
+    if let Err(err) = set_antigravity_mcp_servers_map(&antigravity_out) {
+        log::warn!("同步 MCP 到 Antigravity 配置失败: {err}");
+    }
+
+    Ok(())
+}
+
+fn build_gemini_mcp_servers_object(
+    servers: &std::collections::HashMap<String, Value>,
+) -> Result<Map<String, Value>, AppError> {
+    let mut out = Map::new();
     for (id, spec) in servers.iter() {
         let mut obj = if let Some(map) = spec.as_object() {
             map.clone()
@@ -155,13 +179,46 @@ pub fn set_mcp_servers_map(
         out.insert(id.clone(), Value::Object(obj));
     }
 
-    {
+    Ok(out)
+}
+
+fn build_antigravity_mcp_servers_object(
+    servers: &std::collections::HashMap<String, Value>,
+) -> Result<Map<String, Value>, AppError> {
+    let mut out = build_gemini_mcp_servers_object(servers)?;
+    for (_, spec) in out.iter_mut() {
+        let Some(obj) = spec.as_object_mut() else {
+            continue;
+        };
+        if let Some(http_url) = obj.remove("httpUrl") {
+            obj.insert("serverUrl".to_string(), http_url);
+        } else if let Some(url) = obj.remove("url") {
+            obj.insert("serverUrl".to_string(), url);
+        }
+    }
+    Ok(out)
+}
+
+fn antigravity_mcp_config_paths() -> Vec<PathBuf> {
+    let gemini_dir = get_gemini_dir();
+    [
+        gemini_dir.join("antigravity").join("mcp_config.json"),
+        gemini_dir.join("antigravity-ide").join("mcp_config.json"),
+        gemini_dir.join("config").join("mcp_config.json"),
+    ]
+    .into_iter()
+    .filter(|path| path.exists() || path.parent().map(|parent| parent.exists()).unwrap_or(false))
+    .collect()
+}
+
+fn set_antigravity_mcp_servers_map(servers: &Map<String, Value>) -> Result<(), AppError> {
+    for path in antigravity_mcp_config_paths() {
+        let mut root = read_json_value(&path)?;
         let obj = root
             .as_object_mut()
-            .ok_or_else(|| AppError::Config("~/.gemini/settings.json 根必须是对象".into()))?;
-        obj.insert("mcpServers".into(), Value::Object(out));
+            .ok_or_else(|| AppError::Config(format!("{} 根必须是对象", path.display())))?;
+        obj.insert("mcpServers".into(), Value::Object(servers.clone()));
+        write_json_value(&path, &root)?;
     }
-
-    write_json_value(&path, &root)?;
     Ok(())
 }

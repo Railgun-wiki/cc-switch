@@ -556,6 +556,23 @@ impl SkillService {
         })
     }
 
+    fn get_app_skills_dirs(app: &AppType) -> Result<Vec<PathBuf>> {
+        let primary = Self::get_app_skills_dir(app)?;
+        if !matches!(app, AppType::Gemini) {
+            return Ok(vec![primary]);
+        }
+
+        let gemini_dir = crate::gemini_config::get_gemini_dir();
+        let mut dirs = vec![primary, gemini_dir.join("antigravity-cli").join("skills")];
+        let antigravity_dir = gemini_dir.join("antigravity");
+        if antigravity_dir.exists() {
+            dirs.push(antigravity_dir.join("skills"));
+        }
+        dirs.sort();
+        dirs.dedup();
+        Ok(dirs)
+    }
+
     // ========== 统一管理方法 ==========
 
     /// 获取所有已安装的 Skills
@@ -1593,27 +1610,30 @@ impl SkillService {
 
         Self::validate_sync_source_dir(&source, directory)?;
 
-        let app_dir = Self::get_app_skills_dir(app)?;
-        fs::create_dir_all(&app_dir)?;
+        for app_dir in Self::get_app_skills_dirs(app)? {
+            fs::create_dir_all(&app_dir)?;
+            Self::sync_to_dest_dir(&source, &app_dir.join(directory), directory, app)?;
+        }
 
-        let dest = app_dir.join(directory);
+        Ok(())
+    }
 
+    fn sync_to_dest_dir(source: &Path, dest: &Path, directory: &str, app: &AppType) -> Result<()> {
         let sync_method = Self::get_sync_method();
 
         match sync_method {
             SyncMethod::Auto => {
-                if dest.exists() && !Self::is_symlink(&dest) {
-                    Self::replace_dest_with_copy(&source, &dest, directory)?;
+                if dest.exists() && !Self::is_symlink(dest) {
+                    Self::replace_dest_with_copy(source, dest, directory)?;
                     log::debug!("Skill {directory} 已通过复制同步到 {app:?}");
                     return Ok(());
                 }
 
-                if Self::is_symlink(&dest) {
-                    Self::remove_path(&dest)?;
+                if Self::is_symlink(dest) {
+                    Self::remove_path(dest)?;
                 }
 
-                // 优先尝试 symlink
-                match Self::create_symlink(&source, &dest) {
+                match Self::create_symlink(source, dest) {
                     Ok(()) => {
                         log::debug!("Skill {directory} 已通过 symlink 同步到 {app:?}");
                         return Ok(());
@@ -1626,19 +1646,18 @@ impl SkillService {
                         );
                     }
                 }
-                // Fallback 到 copy
-                Self::replace_dest_with_copy(&source, &dest, directory)?;
+                Self::replace_dest_with_copy(source, dest, directory)?;
                 log::debug!("Skill {directory} 已通过复制同步到 {app:?}");
             }
             SyncMethod::Symlink => {
-                if dest.exists() || Self::is_symlink(&dest) {
-                    Self::remove_path(&dest)?;
+                if dest.exists() || Self::is_symlink(dest) {
+                    Self::remove_path(dest)?;
                 }
-                Self::create_symlink(&source, &dest)?;
+                Self::create_symlink(source, dest)?;
                 log::debug!("Skill {directory} 已通过 symlink 同步到 {app:?}");
             }
             SyncMethod::Copy => {
-                Self::replace_dest_with_copy(&source, &dest, directory)?;
+                Self::replace_dest_with_copy(source, dest, directory)?;
                 log::debug!("Skill {directory} 已通过复制同步到 {app:?}");
             }
         }
@@ -1760,12 +1779,12 @@ impl SkillService {
             return Ok(());
         }
 
-        let app_dir = Self::get_app_skills_dir(app)?;
-        let skill_path = app_dir.join(directory);
-
-        if skill_path.exists() || Self::is_symlink(&skill_path) {
-            Self::remove_path(&skill_path)?;
-            log::debug!("Skill {directory} 已从 {app:?} 删除");
+        for app_dir in Self::get_app_skills_dirs(app)? {
+            let skill_path = app_dir.join(directory);
+            if skill_path.exists() || Self::is_symlink(&skill_path) {
+                Self::remove_path(&skill_path)?;
+                log::debug!("Skill {directory} 已从 {app:?} 删除");
+            }
         }
 
         Ok(())
@@ -1779,32 +1798,34 @@ impl SkillService {
 
         let skills = db.get_all_installed_skills()?;
         let ssot_dir = Self::get_ssot_dir()?;
-        let app_dir = Self::get_app_skills_dir(app)?;
+        let app_dirs = Self::get_app_skills_dirs(app)?;
 
         let indexed_skills: HashMap<String, &InstalledSkill> = skills
             .values()
             .map(|skill| (skill.directory.to_lowercase(), skill))
             .collect();
 
-        if app_dir.exists() {
-            for entry in fs::read_dir(&app_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                let dir_name = entry.file_name().to_string_lossy().to_string();
+        for app_dir in &app_dirs {
+            if app_dir.exists() {
+                for entry in fs::read_dir(app_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    let dir_name = entry.file_name().to_string_lossy().to_string();
 
-                if dir_name.starts_with('.') {
-                    continue;
-                }
+                    if dir_name.starts_with('.') {
+                        continue;
+                    }
 
-                if let Some(skill) = indexed_skills.get(&dir_name.to_lowercase()) {
-                    if !skill.apps.is_enabled_for(app) {
+                    if let Some(skill) = indexed_skills.get(&dir_name.to_lowercase()) {
+                        if !skill.apps.is_enabled_for(app) {
+                            Self::remove_path(&path)?;
+                        }
+                        continue;
+                    }
+
+                    if Self::is_symlink_to_ssot(&path, &ssot_dir) {
                         Self::remove_path(&path)?;
                     }
-                    continue;
-                }
-
-                if Self::is_symlink_to_ssot(&path, &ssot_dir) {
-                    Self::remove_path(&path)?;
                 }
             }
         }

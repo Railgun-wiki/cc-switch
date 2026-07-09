@@ -291,9 +291,10 @@ fn push_provider_model_filters(
 pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
     let data_source = data_source_expr(log_alias);
     let proxy_data_source = data_source_expr("proxy_dedup");
+    let effective_model = effective_model_sql(log_alias);
     format!(
         "NOT (
-            {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'opencode_session')
+            {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'antigravity_session', 'opencode_session')
             AND EXISTS (
                 SELECT 1
                 FROM proxy_request_logs proxy_dedup
@@ -308,7 +309,7 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
                       proxy_dedup.cache_creation_tokens = {log_alias}.cache_creation_tokens
                       OR (
                           {log_alias}.cache_creation_tokens = 0
-                          AND {data_source} IN ('codex_session', 'gemini_session', 'opencode_session')
+                          AND {data_source} IN ('codex_session', 'gemini_session', 'antigravity_session', 'opencode_session')
                       )
                   )
                   AND proxy_dedup.created_at BETWEEN
@@ -316,6 +317,7 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
                       AND {log_alias}.created_at + {SESSION_PROXY_DEDUP_WINDOW_SECONDS}
                   AND (
                       LOWER(proxy_dedup.model) = LOWER({log_alias}.model)
+                      OR LOWER(proxy_dedup.model) = LOWER({effective_model})
                       OR LOWER(proxy_dedup.model) = 'unknown'
                       OR LOWER({log_alias}.model) = 'unknown'
                   )
