@@ -552,7 +552,11 @@ fn sync_single_antigravity_db(db: &Database, db_path: &Path) -> Result<(u32, u32
     let file_path_str = db_path.to_string_lossy().to_string();
     let metadata =
         fs::metadata(db_path).map_err(|e| AppError::Config(format!("无法读取文件元数据: {e}")))?;
-    let file_modified = metadata_modified_nanos(&metadata);
+    let mut file_modified = metadata_modified_nanos(&metadata);
+    let wal_path = db_path.with_extension("db-wal");
+    if let Ok(wal_meta) = fs::metadata(&wal_path) {
+        file_modified = file_modified.max(metadata_modified_nanos(&wal_meta));
+    }
     let file_modified_secs = metadata
         .modified()
         .ok()
@@ -828,6 +832,8 @@ fn insert_antigravity_session_entry(
     created_at: i64,
 ) -> Result<bool, AppError> {
     let conn = lock_conn!(db.conn);
+    // Agy gen_metadata 中 f3 已包含 thinking 输出候选；真实样本里 f1.f4/f1.f17.f2
+    // 同时出现时 f3 >= f10，相加会重复计费。
     let output_tokens = token_data.output_tokens.max(token_data.thoughts_tokens);
     let raw_model = token_data.model.trim();
     let model = if raw_model.is_empty() {
