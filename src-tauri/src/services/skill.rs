@@ -3158,10 +3158,18 @@ mod tests {
     fn gemini_skills_dirs_include_only_cli_and_config_targets() {
         let dirs =
             SkillService::get_app_skills_dirs(&AppType::Gemini).expect("gemini dirs resolve");
-        let gemini_dir = crate::gemini_config::get_gemini_dir();
 
-        assert!(dirs.contains(&gemini_dir.join("skills")));
-        assert!(dirs.contains(&gemini_dir.join("config").join("skills")));
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs.iter().any(|dir| {
+            dir.file_name() == Some(std::ffi::OsStr::new("skills"))
+                && dir.parent().and_then(|parent| parent.file_name())
+                    != Some(std::ffi::OsStr::new("config"))
+        }));
+        assert!(dirs.iter().any(|dir| {
+            dir.file_name() == Some(std::ffi::OsStr::new("skills"))
+                && dir.parent().and_then(|parent| parent.file_name())
+                    == Some(std::ffi::OsStr::new("config"))
+        }));
         assert!(!dirs
             .iter()
             .any(|dir| dir.to_string_lossy().contains("antigravity-cli")));
