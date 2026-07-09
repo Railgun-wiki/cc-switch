@@ -2320,6 +2320,7 @@ mod tests {
                 request_id TEXT PRIMARY KEY,
                 app_type TEXT NOT NULL,
                 model TEXT NOT NULL,
+                pricing_model TEXT,
                 input_tokens INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
                 cache_read_tokens INTEGER NOT NULL,
