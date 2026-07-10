@@ -8,6 +8,10 @@ use crate::session_manager::{SessionMessage, SessionMeta};
 use super::utils::{parse_timestamp_to_ms, truncate_summary};
 
 const PROVIDER_ID: &str = "gemini";
+// Storage invariant: except for `tempmediaStorage` (temporary media cache),
+// session directories and `.db`/`.pb` conversation files in these three roots
+// use disjoint UUIDs. Cross-root de-duplication below is only defensive for
+// transcript metadata and must not be used to infer duplicated usage records.
 const ANTIGRAVITY_ROOTS: [&str; 3] = ["antigravity", "antigravity-cli", "antigravity-ide"];
 
 pub fn scan_sessions() -> Vec<SessionMeta> {

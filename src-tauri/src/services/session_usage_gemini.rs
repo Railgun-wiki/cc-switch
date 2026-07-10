@@ -382,6 +382,9 @@ fn find_gemini_pricing(conn: &rusqlite::Connection, model_id: &str) -> Option<Mo
     find_model_pricing(conn, model_id)
 }
 
+// Storage invariant: except for `tempmediaStorage` (temporary media cache),
+// session directories and `.db`/`.pb` conversation files in these three roots
+// use disjoint UUIDs.
 const ANTIGRAVITY_ROOTS: [&str; 3] = ["antigravity", "antigravity-cli", "antigravity-ide"];
 // Antigravity keeps rows mutable while the session DB has a running step.
 // Observed DB state: status 2 means the step is still running; canceled,
