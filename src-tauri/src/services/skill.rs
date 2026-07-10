@@ -570,8 +570,11 @@ impl SkillService {
     /// 获取应用 Skill 实际写入（符号链接/复制/删除）的目标目录
     ///
     /// 对于 Gemini：
-    /// - 始终保留对 `~/.gemini/skills/`（gemini-cli）的支持以确保向后兼容。
-    /// - 若检测到当前系统处于 agy 环境（通过 `is_agy_active`），则动态追加对 `~/.gemini/config/skills/` 的同步写入。
+    /// - `~/.gemini/skills/` 是 gemini-cli 的专属 Skill 目录，始终保留以确保向后兼容。
+    /// - `~/.gemini/config/skills/` 是 Antigravity (agy) 三个客户端共享的通用 Skill
+    ///   目录；检测到 agy 环境时，写入/链接/删除只处理这个通用目录。
+    /// - `~/.gemini/antigravity*/skills/` 是各 agy 客户端维护的私有目录。它们只作为
+    ///   扫描/导入来源，不作为 CC Switch 的写入或删除目标，避免误删客户端私有状态。
     pub fn get_app_skills_dirs(app: &AppType) -> Result<Vec<PathBuf>> {
         let primary = Self::get_app_skills_dir(app)?;
         if !matches!(app, AppType::Gemini) {
@@ -592,6 +595,11 @@ impl SkillService {
     }
 
     /// 获取应用 Skill 扫描与导入的候选目录（始终全量扫描以防遗漏）
+    ///
+    /// 注意：Gemini 的扫描口径故意大于写入口径。前端“导入已有”需要发现
+    /// `~/.gemini/config/skills/` 以及 `~/.gemini/antigravity*/skills/` 中的既有
+    /// Skill；但安装、同步、禁用和删除仍只通过 [`Self::get_app_skills_dirs`] 处理
+    /// gemini-cli 专属目录和 agy 通用目录。
     pub fn get_app_skills_scan_dirs(app: &AppType) -> Result<Vec<PathBuf>> {
         let primary = Self::get_app_skills_dir(app)?; // 包含 ~/.gemini/skills/
         if !matches!(app, AppType::Gemini) {
@@ -1872,6 +1880,8 @@ impl SkillService {
             return Ok(());
         }
 
+        // 删除与写入保持同一口径：只清理 CC Switch 管理的实际投影目标，
+        // 不触碰仅用于扫描/导入的 Antigravity 私有 Skill 目录。
         for app_dir in Self::get_app_skills_dirs(app)? {
             let skill_path = app_dir.join(directory);
             if skill_path.exists() || Self::is_symlink(&skill_path) {
