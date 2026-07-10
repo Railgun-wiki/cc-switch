@@ -59,13 +59,33 @@ impl CostCalculator {
         pricing: &ModelPricing,
         cost_multiplier: Decimal,
     ) -> CostBreakdown {
-        let input_includes_cache_read = matches!(app_type, "codex" | "gemini");
+        Self::calculate_for_app_and_data_source(app_type, None, usage, pricing, cost_multiplier)
+    }
+
+    /// 按 app_type 与数据源选择输入 token 语义后计算成本。
+    ///
+    /// Antigravity 离线会话的 `gen_metadata` 使用 `f2` 记录 fresh input、
+    /// 使用 `f5` 记录 cache read。该例外只适用于导入的
+    /// `antigravity_session` 行；Agy 代理响应不在这里推断或支持。
+    pub fn calculate_for_app_and_data_source(
+        app_type: &str,
+        data_source: Option<&str>,
+        usage: &TokenUsage,
+        pricing: &ModelPricing,
+        cost_multiplier: Decimal,
+    ) -> CostBreakdown {
+        let input_includes_cache_read = Self::input_includes_cache_read(app_type, data_source);
         Self::calculate_with_cache_semantics(
             usage,
             pricing,
             cost_multiplier,
             input_includes_cache_read,
         )
+    }
+
+    /// Returns whether a stored row's input counter includes cache reads.
+    pub fn input_includes_cache_read(app_type: &str, data_source: Option<&str>) -> bool {
+        data_source != Some("antigravity_session") && matches!(app_type, "codex" | "gemini")
     }
 
     fn calculate_with_cache_semantics(
@@ -206,6 +226,32 @@ mod tests {
             Decimal::from_str("0.000375").unwrap()
         );
         assert_eq!(cost.total_cost, Decimal::from_str("0.010335").unwrap());
+    }
+
+    #[test]
+    fn test_antigravity_session_keeps_fresh_input_for_gemini_app_type() {
+        let usage = TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_read_tokens: 2_000,
+            cache_creation_tokens: 0,
+            model: None,
+            message_id: None,
+        };
+        let pricing = ModelPricing::from_strings("3.0", "15.0", "0.3", "0").unwrap();
+
+        let cost = CostCalculator::calculate_for_app_and_data_source(
+            "gemini",
+            Some("antigravity_session"),
+            &usage,
+            &pricing,
+            Decimal::ONE,
+        );
+
+        assert_eq!(cost.input_cost, Decimal::from_str("0.003").unwrap());
+        assert_eq!(cost.output_cost, Decimal::from_str("0.0075").unwrap());
+        assert_eq!(cost.cache_read_cost, Decimal::from_str("0.0006").unwrap());
+        assert_eq!(cost.total_cost, Decimal::from_str("0.0111").unwrap());
     }
 
     #[test]

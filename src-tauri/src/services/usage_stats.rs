@@ -4,7 +4,7 @@
 
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
-use crate::proxy::usage::calculator::ModelPricing;
+use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
 use crate::services::sql_helpers::fresh_input_sql;
 use chrono::{Local, NaiveDate, TimeZone, Timelike};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -1816,11 +1816,12 @@ impl Database {
 
         let million = rust_decimal::Decimal::from(1_000_000u64);
 
-        // 与 CostCalculator::calculate_for_app 保持一致的计算逻辑：
-        // 1. Codex/Gemini 的 input_tokens 包含 cache_read_tokens，需要扣除后按输入价计费
-        // 2. Claude/Anthropic 的 input_tokens 已经是 fresh input，不能再次扣减
-        // 3. 各项成本是基础成本（不含倍率），倍率只作用于最终总价
-        let input_includes_cache_read = matches!(log.app_type.as_str(), "codex" | "gemini");
+        // 与 CostCalculator::calculate_for_app_and_data_source 保持一致：
+        // Codex/Gemini 代理行的 input_tokens 包含 cache read；但 Agy 离线
+        // gen_metadata 行（antigravity_session）把 f2 作为 fresh input、f5
+        // 作为 cache read。代理响应不在这个离线例外的支持范围内。
+        let input_includes_cache_read =
+            CostCalculator::input_includes_cache_read(&log.app_type, Some(&log.data_source));
         let billable_input_tokens = if input_includes_cache_read {
             (log.input_tokens as u64).saturating_sub(log.cache_read_tokens as u64)
         } else {
@@ -2905,6 +2906,45 @@ mod tests {
         assert_eq!(input_cost, "0.000100");
         assert_eq!(cache_read_cost, "0.000020");
         assert_eq!(total_cost, "0.000120");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_backfill_antigravity_session_keeps_fresh_input() -> Result<(), AppError> {
+        let db = Database::memory()?;
+
+        {
+            let conn = lock_conn!(db.conn);
+            insert_usage_log(
+                &conn,
+                "antigravity-cache-fresh-input",
+                "gemini",
+                "_gemini_antigravity_session",
+                "claude-haiku-4-5",
+                "antigravity_session",
+                1000,
+                1000,
+                100,
+                2000,
+                0,
+                200,
+                "0",
+            )?;
+        }
+
+        assert_eq!(db.backfill_missing_usage_costs()?, 1);
+
+        let conn = lock_conn!(db.conn);
+        let (input_cost, cache_read_cost, total_cost): (String, String, String) = conn.query_row(
+            "SELECT input_cost_usd, cache_read_cost_usd, total_cost_usd
+             FROM proxy_request_logs WHERE request_id = 'antigravity-cache-fresh-input'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(input_cost, "0.000100");
+        assert_eq!(cache_read_cost, "0.000200");
+        assert_eq!(total_cost, "0.000300");
 
         Ok(())
     }

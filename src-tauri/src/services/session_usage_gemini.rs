@@ -489,16 +489,12 @@ struct AntigravityTokenData {
     input_tokens: u32,
     output_tokens: u32,
     cached_tokens: u32,
-    thoughts_tokens: u32,
     model: String,
 }
 
 impl AntigravityTokenData {
     fn has_tokens(&self) -> bool {
-        self.input_tokens != 0
-            || self.output_tokens != 0
-            || self.cached_tokens != 0
-            || self.thoughts_tokens != 0
+        self.input_tokens != 0 || self.output_tokens != 0 || self.cached_tokens != 0
     }
 }
 
@@ -849,10 +845,12 @@ fn extract_token_fields(data: &[u8], tokens: &mut AntigravityTokenData) {
             continue;
         };
         match field {
+            // Agy `gen_metadata` only: f2 is fresh input, f3 is total output,
+            // and f5 is cache-read input. This does not describe Agy proxy
+            // responses, which are intentionally outside this offline importer.
             2 => tokens.input_tokens = value as u32,
             3 => tokens.output_tokens = value as u32,
-            9 => tokens.cached_tokens = value as u32,
-            10 => tokens.thoughts_tokens = value as u32,
+            5 => tokens.cached_tokens = value as u32,
             _ => {}
         }
     }
@@ -891,9 +889,8 @@ fn insert_antigravity_session_entry(
     created_at: i64,
 ) -> Result<bool, AppError> {
     let conn = lock_conn!(db.conn);
-    // Agy gen_metadata 中 f3 已包含 thinking 输出候选；真实样本里 f1.f4/f1.f17.f2
-    // 同时出现时 f3 >= f10，相加会重复计费。
-    let output_tokens = token_data.output_tokens.max(token_data.thoughts_tokens);
+    // Agy gen_metadata 的 f3 已是完整输出（包含 thinking），无需额外合并 f9/f10。
+    let output_tokens = token_data.output_tokens;
     let raw_model = token_data.model.trim();
     let model = if raw_model.is_empty() {
         "unknown"
@@ -933,7 +930,13 @@ fn insert_antigravity_session_entry(
     let (input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost) = match pricing
     {
         Some(pricing) => {
-            let cost = CostCalculator::calculate_for_app("gemini", &usage, &pricing, multiplier);
+            let cost = CostCalculator::calculate_for_app_and_data_source(
+                "gemini",
+                Some("antigravity_session"),
+                &usage,
+                &pricing,
+                multiplier,
+            );
             (
                 cost.input_cost.to_string(),
                 cost.output_cost.to_string(),
@@ -1178,6 +1181,36 @@ mod tests {
         out
     }
 
+    fn antigravity_gen_metadata(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        non_thinking_output: u64,
+        thinking_output: u64,
+    ) -> Vec<u8> {
+        let mut usage = proto_varint_field(1, 1016);
+        usage.extend(proto_varint_field(2, input));
+        usage.extend(proto_varint_field(3, output));
+        usage.extend(proto_varint_field(5, cache_read));
+        usage.extend(proto_varint_field(9, non_thinking_output));
+        usage.extend(proto_varint_field(10, thinking_output));
+
+        let mut metadata = proto_len_field(4, usage);
+        metadata.extend(proto_len_field(19, b"gemini-3-flash-a".to_vec()));
+        proto_len_field(1, metadata)
+    }
+
+    #[test]
+    fn test_parse_antigravity_usage_uses_f2_f3_f5_only() {
+        let data = antigravity_gen_metadata(8_741, 14_479, 28_519, 12_672, 1_807);
+
+        let usage = parse_gen_metadata_blob(&data).expect("Agy usage should parse");
+        assert_eq!(usage.input_tokens, 8_741);
+        assert_eq!(usage.output_tokens, 14_479);
+        assert_eq!(usage.cached_tokens, 28_519);
+        assert_eq!(usage.model, "gemini-3-flash-a");
+    }
+
     fn step_metadata(gen_idx: i64, timestamp: i64) -> Vec<u8> {
         let ts = proto_varint_field(1, timestamp as u64);
         let gen_ref = proto_varint_field(3, gen_idx as u64);
@@ -1288,7 +1321,6 @@ mod tests {
             input_tokens: 10,
             output_tokens: 2,
             cached_tokens: 1,
-            thoughts_tokens: 0,
             model: "gemini-3-pro-b".to_string(),
         };
         assert!(insert_antigravity_session_entry(
@@ -1301,9 +1333,8 @@ mod tests {
 
         let second = AntigravityTokenData {
             input_tokens: 20,
-            output_tokens: 3,
+            output_tokens: 7,
             cached_tokens: 2,
-            thoughts_tokens: 7,
             model: "gemini-3-flash-a-thinking".to_string(),
         };
         assert!(insert_antigravity_session_entry(
