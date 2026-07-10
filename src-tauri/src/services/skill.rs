@@ -1653,31 +1653,60 @@ impl SkillService {
 
         Self::validate_sync_source_dir(&source, directory)?;
 
-        let mut synced_paths: Vec<PathBuf> = Vec::new();
         let app_dirs = Self::get_app_skills_dirs(app)?;
-        for app_dir in &app_dirs {
-            let dest = app_dir.join(directory);
-            let sync_res = (|| -> Result<()> {
-                fs::create_dir_all(app_dir)?;
-                Self::sync_to_dest_dir(&source, &dest, directory, app)?;
-                Ok(())
-            })();
-            if let Err(err) = sync_res {
-                log::warn!(
-                    "同步 Skill {} 到 {:?} 失败，执行精细化回滚: {err:#}",
-                    directory,
-                    dest
-                );
-                // 仅回滚当前循环中已经成功写入/修改的路径
-                for path in synced_paths {
-                    let _ = Self::remove_path(&path);
-                }
-                return Err(err);
-            }
-            // 记录成功写入的路径
-            synced_paths.push(dest);
+        if matches!(app, AppType::Gemini) && app_dirs.len() > 1 {
+            return Self::sync_to_gemini_dirs_best_effort(&source, directory, &app_dirs);
         }
 
+        let app_dir = app_dirs
+            .first()
+            .ok_or_else(|| anyhow!("Skill 同步目标目录为空: {app:?}"))?;
+        let dest = app_dir.join(directory);
+        fs::create_dir_all(app_dir)?;
+        Self::sync_to_dest_dir(&source, &dest, directory, app)?;
+
+        Ok(())
+    }
+
+    /// Gemini 同时投影到 CLI 与 Antigravity 目录时，保留已成功的目标。
+    ///
+    /// 这些目录是同一 Skill 的多个运行时入口。单个目录的失败不应删除其他
+    /// 已成功的同步结果；所有目标都失败时仍返回错误，以保持交互式操作的失败语义。
+    fn sync_to_gemini_dirs_best_effort(
+        source: &Path,
+        directory: &str,
+        app_dirs: &[PathBuf],
+    ) -> Result<()> {
+        let mut success_count = 0usize;
+        let mut failures = Vec::new();
+
+        for app_dir in app_dirs {
+            let dest = app_dir.join(directory);
+            let sync_result = (|| -> Result<()> {
+                fs::create_dir_all(app_dir)?;
+                Self::sync_to_dest_dir(source, &dest, directory, &AppType::Gemini)
+            })();
+            match sync_result {
+                Ok(()) => success_count += 1,
+                Err(err) => failures.push(format!("{}: {err:#}", dest.display())),
+            }
+        }
+
+        if failures.is_empty() {
+            return Ok(());
+        }
+
+        let failure_summary = failures.join("; ");
+        if success_count == 0 {
+            return Err(anyhow!(
+                "同步 Skill {directory} 到 Gemini 所有目标目录均失败: {failure_summary}"
+            ));
+        }
+
+        log::warn!(
+            "Skill 多目录同步部分失败: skill={directory}, app=gemini, succeeded={success_count}, failed={}, failures=[{failure_summary}]",
+            failures.len()
+        );
         Ok(())
     }
 
@@ -3157,6 +3186,12 @@ mod tests {
         .expect("write SKILL.md");
     }
 
+    fn invalid_skill_target_parent(temp: &Path, name: &str) -> PathBuf {
+        let parent = temp.join(name);
+        fs::write(&parent, "not a directory").expect("write blocking file");
+        parent.join("skills")
+    }
+
     #[test]
     fn resolve_skill_source_dir_returns_repo_root_for_root_level_skill() {
         let temp = tempdir().expect("tempdir");
@@ -3224,5 +3259,83 @@ mod tests {
             assert_eq!(dirs.len(), 1);
             assert!(dirs[0].to_string_lossy().ends_with(".gemini/skills"));
         }
+    }
+
+    #[test]
+    fn gemini_multi_dir_sync_keeps_success_when_a_later_target_fails() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source-skill");
+        let successful_dir = temp.path().join("gemini-cli").join("skills");
+        let failed_dir = invalid_skill_target_parent(temp.path(), "blocked-agy-parent");
+        write_skill(&source, "Source Skill");
+
+        SkillService::sync_to_gemini_dirs_best_effort(
+            &source,
+            "source-skill",
+            &[successful_dir.clone(), failed_dir],
+        )
+        .expect("one successful target keeps the operation successful");
+
+        assert!(successful_dir
+            .join("source-skill")
+            .join("SKILL.md")
+            .is_file());
+    }
+
+    #[test]
+    fn gemini_multi_dir_sync_continues_after_an_early_failure() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source-skill");
+        let failed_dir = invalid_skill_target_parent(temp.path(), "blocked-cli-parent");
+        let successful_dir = temp.path().join("antigravity").join("skills");
+        write_skill(&source, "Source Skill");
+
+        SkillService::sync_to_gemini_dirs_best_effort(
+            &source,
+            "source-skill",
+            &[failed_dir, successful_dir.clone()],
+        )
+        .expect("later successful target should still be attempted");
+
+        assert!(successful_dir
+            .join("source-skill")
+            .join("SKILL.md")
+            .is_file());
+    }
+
+    #[test]
+    fn gemini_multi_dir_sync_errors_when_every_target_fails() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source-skill");
+        let first_failed_dir = invalid_skill_target_parent(temp.path(), "blocked-cli-parent");
+        let second_failed_dir = invalid_skill_target_parent(temp.path(), "blocked-agy-parent");
+        write_skill(&source, "Source Skill");
+
+        let err = SkillService::sync_to_gemini_dirs_best_effort(
+            &source,
+            "source-skill",
+            &[first_failed_dir, second_failed_dir],
+        )
+        .expect_err("all failed targets should fail the operation");
+
+        assert!(err.to_string().contains("所有目标目录均失败"));
+    }
+
+    #[test]
+    fn single_target_sync_failure_still_propagates() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source-skill");
+        let failed_dir = invalid_skill_target_parent(temp.path(), "blocked-parent");
+        write_skill(&source, "Source Skill");
+
+        let err = SkillService::sync_to_dest_dir(
+            &source,
+            &failed_dir.join("source-skill"),
+            "source-skill",
+            &AppType::Codex,
+        )
+        .expect_err("single target errors must still propagate");
+
+        assert!(!err.to_string().is_empty());
     }
 }
