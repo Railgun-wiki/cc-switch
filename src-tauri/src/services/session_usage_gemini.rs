@@ -908,6 +908,11 @@ fn insert_antigravity_session_entry(
         cache_creation_tokens: 0,
         created_at,
     };
+    // This is the shared Gemini-session/proxy deduplication guard, reused to
+    // avoid counting a generic Gemini proxy log and its offline session log
+    // twice. It does not parse, infer token semantics for, or promise support
+    // for Antigravity-specific proxy responses; this importer only handles
+    // Antigravity's offline `gen_metadata` format above.
     if has_matching_proxy_usage_log(&conn, &dedup_key)? {
         return Ok(false);
     }
