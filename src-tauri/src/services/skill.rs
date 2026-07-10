@@ -1653,13 +1653,16 @@ impl SkillService {
 
         Self::validate_sync_source_dir(&source, directory)?;
 
-        let mut synced_paths = Vec::new();
+        let mut synced_paths: Vec<PathBuf> = Vec::new();
         let app_dirs = Self::get_app_skills_dirs(app)?;
         for app_dir in &app_dirs {
             let dest = app_dir.join(directory);
-            if let Err(err) = fs::create_dir_all(app_dir)
-                .and_then(|_| Self::sync_to_dest_dir(&source, &dest, directory, app))
-            {
+            let sync_res = (|| -> Result<()> {
+                fs::create_dir_all(app_dir)?;
+                Self::sync_to_dest_dir(&source, &dest, directory, app)?;
+                Ok(())
+            })();
+            if let Err(err) = sync_res {
                 log::warn!(
                     "同步 Skill {} 到 {:?} 失败，执行精细化回滚: {err:#}",
                     directory,

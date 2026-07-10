@@ -574,7 +574,7 @@ fn sync_single_antigravity_db(db: &Database, db_path: &Path) -> Result<(u32, u32
         return Ok((0, 0));
     }
 
-    let agy_conn = rusqlite::Connection::open_with_flags(
+    let mut agy_conn = rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
