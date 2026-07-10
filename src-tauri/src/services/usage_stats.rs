@@ -1821,7 +1821,7 @@ impl Database {
         // gen_metadata 行（antigravity_session）把 f2 作为 fresh input、f5
         // 作为 cache read。代理响应不在这个离线例外的支持范围内。
         let input_includes_cache_read =
-            CostCalculator::input_includes_cache_read(&log.app_type, Some(&log.data_source));
+            CostCalculator::input_includes_cache_read(&log.app_type, log.data_source.as_deref());
         let billable_input_tokens = if input_includes_cache_read {
             (log.input_tokens as u64).saturating_sub(log.cache_read_tokens as u64)
         } else {
