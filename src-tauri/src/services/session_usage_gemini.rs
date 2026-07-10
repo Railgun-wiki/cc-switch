@@ -482,17 +482,6 @@ impl<'a> ProtoParser<'a> {
         }
         None
     }
-
-    fn get_string(&mut self, target_field: u32) -> Option<String> {
-        while let Some((field, value)) = self.next_field() {
-            if field == target_field {
-                if let ProtoValue::LengthDelimited(val) = value {
-                    return String::from_utf8(val).ok();
-                }
-            }
-        }
-        None
-    }
 }
 
 #[derive(Debug, Default)]
