@@ -577,9 +577,13 @@ fn sync_single_antigravity_db(db: &Database, db_path: &Path) -> Result<(u32, u32
         .map_err(|e| AppError::Database(format!("无法开启只读事务: {e}")))?;
 
     let trajectory_meta = read_trajectory_metadata(&tx);
-    let step_states = read_step_states(&tx);
-    let gen_entries = read_gen_metadata_entries(&tx);
-    let _ = tx.commit();
+    // `gen_metadata` and `steps` determine whether it is safe to advance the
+    // checkpoint. Propagate failures instead of treating them as empty tables:
+    // a transient SQLite error must leave this DB eligible for a later retry.
+    let step_states = read_step_states(&tx)?;
+    let gen_entries = read_gen_metadata_entries(&tx)?;
+    tx.commit()
+        .map_err(|e| AppError::Database(format!("无法提交 Antigravity 只读事务: {e}")))?;
     if gen_entries.is_empty() {
         if !step_states.has_running_step {
             update_sync_state(db, &file_path_str, file_modified, 0)?;
@@ -677,81 +681,75 @@ fn read_trajectory_metadata(conn: &rusqlite::Connection) -> Option<TrajectoryMet
     Some(meta)
 }
 
-fn read_gen_metadata_entries(conn: &rusqlite::Connection) -> Vec<GenMetadataEntry> {
+fn read_gen_metadata_entries(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<GenMetadataEntry>, AppError> {
     let mut entries = Vec::new();
-    let mut stmt = match conn.prepare("SELECT idx, data FROM gen_metadata ORDER BY idx") {
-        Ok(stmt) => stmt,
-        Err(_) => return entries,
-    };
+    let mut stmt = conn
+        .prepare("SELECT idx, data FROM gen_metadata ORDER BY idx")
+        .map_err(|e| AppError::Database(format!("读取 Antigravity gen_metadata 失败: {e}")))?;
     let rows = stmt
         .query_map([], |row| {
             let idx: i64 = row.get(0)?;
             let data: Vec<u8> = row.get(1)?;
             Ok((idx, data))
         })
-        .ok();
+        .map_err(|e| AppError::Database(format!("查询 Antigravity gen_metadata 失败: {e}")))?;
 
-    if let Some(rows) = rows {
-        for row in rows.flatten() {
-            let (idx, data) = row;
-            entries.push(GenMetadataEntry {
-                idx,
-                token_data: parse_gen_metadata_blob(&data),
-            });
-        }
+    for row in rows {
+        let (idx, data) = row.map_err(|e| {
+            AppError::Database(format!("读取 Antigravity gen_metadata 行失败: {e}"))
+        })?;
+        entries.push(GenMetadataEntry {
+            idx,
+            token_data: parse_gen_metadata_blob(&data),
+        });
     }
 
-    entries
+    Ok(entries)
 }
 
-fn read_step_states(conn: &rusqlite::Connection) -> AntigravityStepStates {
+fn read_step_states(conn: &rusqlite::Connection) -> Result<AntigravityStepStates, AppError> {
     let mut by_gen_idx = HashMap::new();
     let mut has_running_step = false;
-    let mut stmt = match conn.prepare("SELECT status, metadata FROM steps") {
-        Ok(stmt) => stmt,
-        Err(_) => {
-            return AntigravityStepStates {
-                by_gen_idx,
-                has_running_step,
-            }
-        }
-    };
+    let mut stmt = conn
+        .prepare("SELECT status, metadata FROM steps")
+        .map_err(|e| AppError::Database(format!("读取 Antigravity steps 失败: {e}")))?;
     let rows = stmt
         .query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
         })
-        .ok();
-    if let Some(rows) = rows {
-        for row in rows.flatten() {
-            let (status, metadata) = row;
-            if status == ANTIGRAVITY_RUNNING_STATUS {
-                has_running_step = true;
-            }
-            let Some(metadata) = metadata else {
-                continue;
-            };
-            if let Some((gen_idx, timestamp)) = parse_step_metadata(&metadata) {
-                by_gen_idx
-                    .entry(gen_idx)
-                    .and_modify(|state: &mut AntigravityStepState| {
-                        if state
-                            .timestamp
-                            .map(|existing| timestamp < existing)
-                            .unwrap_or(true)
-                        {
-                            state.timestamp = Some(timestamp);
-                        }
-                    })
-                    .or_insert(AntigravityStepState {
-                        timestamp: Some(timestamp),
-                    });
-            }
+        .map_err(|e| AppError::Database(format!("查询 Antigravity steps 失败: {e}")))?;
+    for row in rows {
+        let (status, metadata) =
+            row.map_err(|e| AppError::Database(format!("读取 Antigravity steps 行失败: {e}")))?;
+        if status == ANTIGRAVITY_RUNNING_STATUS {
+            has_running_step = true;
+        }
+        let Some(metadata) = metadata else {
+            continue;
+        };
+        if let Some((gen_idx, timestamp)) = parse_step_metadata(&metadata) {
+            by_gen_idx
+                .entry(gen_idx)
+                .and_modify(|state: &mut AntigravityStepState| {
+                    if state
+                        .timestamp
+                        .map(|existing| timestamp < existing)
+                        .unwrap_or(true)
+                    {
+                        state.timestamp = Some(timestamp);
+                    }
+                })
+                .or_insert(AntigravityStepState {
+                    timestamp: Some(timestamp),
+                });
         }
     }
-    AntigravityStepStates {
+    Ok(AntigravityStepStates {
         by_gen_idx,
         has_running_step,
-    }
+    })
 }
 
 fn parse_step_metadata(data: &[u8]) -> Option<(i64, i64)> {
@@ -1238,7 +1236,7 @@ mod tests {
         )
         .unwrap();
 
-        let states = read_step_states(&conn);
+        let states = read_step_states(&conn).expect("read step states");
         assert!(!states.has_running_step);
         assert_eq!(
             states.by_gen_idx.get(&1).and_then(|s| s.timestamp),
@@ -1254,7 +1252,7 @@ mod tests {
             rusqlite::params![ANTIGRAVITY_RUNNING_STATUS, step_metadata(3, 300)],
         )
         .unwrap();
-        let states = read_step_states(&conn);
+        let states = read_step_states(&conn).expect("read step states");
         assert!(states.has_running_step);
         assert_eq!(
             states.by_gen_idx.get(&3).and_then(|s| s.timestamp),
@@ -1284,6 +1282,30 @@ mod tests {
         let db = Database::memory()?;
         let (imported, skipped) = sync_single_antigravity_db(&db, &db_path)?;
         assert_eq!((imported, skipped), (0, 0));
+
+        let key = db_path.to_string_lossy().to_string();
+        let (last_modified, last_offset) = get_sync_state(&db, &key)?;
+        assert_eq!((last_modified, last_offset), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_antigravity_db_does_not_checkpoint_when_step_read_fails() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agy.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path)
+                .map_err(|e| AppError::Database(format!("open fixture db: {e}")))?;
+            // Deliberately omit `steps` to model an unavailable/incomplete
+            // Antigravity schema. A read failure must not be acknowledged.
+            conn.execute_batch(
+                "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);",
+            )
+            .map_err(|e| AppError::Database(format!("create fixture schema: {e}")))?;
+        }
+
+        let db = Database::memory()?;
+        assert!(sync_single_antigravity_db(&db, &db_path).is_err());
 
         let key = db_path.to_string_lossy().to_string();
         let (last_modified, last_offset) = get_sync_state(&db, &key)?;
