@@ -1816,12 +1816,10 @@ impl Database {
 
         let million = rust_decimal::Decimal::from(1_000_000u64);
 
-        // 与 CostCalculator::calculate_for_app_and_data_source 保持一致：
-        // Codex/Gemini 代理行的 input_tokens 包含 cache read；但 Agy 离线
-        // gen_metadata 行（antigravity_session）把 f2 作为 fresh input、f5
-        // 作为 cache read。代理响应不在这个离线例外的支持范围内。
-        let input_includes_cache_read =
-            CostCalculator::input_includes_cache_read(&log.app_type, log.data_source.as_deref());
+        // 与 CostCalculator::calculate_for_app 保持一致：Codex/Gemini 的
+        // input_tokens 均已按上游语义规范化为包含 cache read；Antigravity
+        // 会话在导入时同样转换为该形式。
+        let input_includes_cache_read = CostCalculator::input_includes_cache_read(&log.app_type);
         let billable_input_tokens = if input_includes_cache_read {
             (log.input_tokens as u64).saturating_sub(log.cache_read_tokens as u64)
         } else {
@@ -2911,7 +2909,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backfill_antigravity_session_keeps_fresh_input() -> Result<(), AppError> {
+    fn test_backfill_antigravity_session_uses_normalized_gemini_input() -> Result<(), AppError> {
         let db = Database::memory()?;
 
         {
@@ -2924,7 +2922,7 @@ mod tests {
                 "claude-haiku-4-5",
                 "antigravity_session",
                 1000,
-                1000,
+                3000,
                 100,
                 2000,
                 0,

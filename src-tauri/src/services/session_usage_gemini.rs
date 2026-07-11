@@ -489,8 +489,11 @@ impl<'a> ProtoParser<'a> {
 
 #[derive(Debug, Default)]
 struct AntigravityTokenData {
+    // Raw `gen_metadata` field f2: fresh input only. The importer combines it
+    // with `cached_tokens` before persistence to match upstream Gemini rows.
     input_tokens: u32,
     output_tokens: u32,
+    // Raw `gen_metadata` field f5: cache-read input.
     cached_tokens: u32,
     model: String,
 }
@@ -847,7 +850,9 @@ fn extract_token_fields(data: &[u8], tokens: &mut AntigravityTokenData) {
         };
         match field {
             // Agy `gen_metadata` only: f2 is fresh input, f3 is total output,
-            // and f5 is cache-read input. This does not describe Agy proxy
+            // and f5 is cache-read input. The importer later persists f2 + f5
+            // as cache-inclusive Gemini input; this parser intentionally keeps
+            // the raw counters separate. This does not describe Agy proxy
             // responses, which are intentionally outside this offline importer.
             2 => tokens.input_tokens = value as u32,
             3 => tokens.output_tokens = value as u32,
@@ -892,6 +897,15 @@ fn insert_antigravity_session_entry(
     let conn = lock_conn!(db.conn);
     // Agy gen_metadata 的 f3 已是完整输出（包含 thinking），无需额外合并 f9/f10。
     let output_tokens = token_data.output_tokens;
+    // Persist Antigravity data with the same cache-inclusive input convention
+    // used by upstream Gemini proxy/session rows. This keeps shared dashboard
+    // aggregations and proxy/session fingerprint de-duplication compatible.
+    let input_tokens = token_data
+        .input_tokens
+        .saturating_add(token_data.cached_tokens);
+    // TODO(migration): Rows imported before this normalization retain the old
+    // fresh-input-only representation. A data migration is intentionally out
+    // of scope; normalizing those rows requires resetting their sync state.
     let raw_model = token_data.model.trim();
     let model = if raw_model.is_empty() {
         "unknown"
@@ -903,7 +917,7 @@ fn insert_antigravity_session_entry(
     let dedup_key = DedupKey {
         app_type: "gemini",
         model: &pricing_model,
-        input_tokens: token_data.input_tokens,
+        input_tokens,
         output_tokens,
         cache_read_tokens: token_data.cached_tokens,
         cache_creation_tokens: 0,
@@ -919,7 +933,7 @@ fn insert_antigravity_session_entry(
     }
 
     let usage = TokenUsage {
-        input_tokens: token_data.input_tokens,
+        input_tokens,
         output_tokens,
         cache_read_tokens: token_data.cached_tokens,
         cache_creation_tokens: 0,
@@ -936,13 +950,7 @@ fn insert_antigravity_session_entry(
     let (input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost) = match pricing
     {
         Some(pricing) => {
-            let cost = CostCalculator::calculate_for_app_and_data_source(
-                "gemini",
-                Some("antigravity_session"),
-                &usage,
-                &pricing,
-                multiplier,
-            );
+            let cost = CostCalculator::calculate_for_app("gemini", &usage, &pricing, multiplier);
             (
                 cost.input_cost.to_string(),
                 cost.output_cost.to_string(),
@@ -993,7 +1001,7 @@ fn insert_antigravity_session_entry(
             "gemini",
             model,
             model,
-            token_data.input_tokens,
+            input_tokens,
             output_tokens,
             token_data.cached_tokens,
             0i64,
@@ -1394,7 +1402,7 @@ mod tests {
         assert_eq!(
             row,
             (
-                20,
+                22,
                 7,
                 2,
                 "gemini-3-flash-a-thinking".to_string(),
