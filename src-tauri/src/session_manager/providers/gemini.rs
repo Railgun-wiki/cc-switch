@@ -365,16 +365,10 @@ fn delete_antigravity_session(root: &Path, path: &Path, session_id: &str) -> Res
         ));
     }
 
-    let brain_dir = root.join("brain").join(session_id);
-    if brain_dir.exists() {
-        std::fs::remove_dir_all(&brain_dir).map_err(|e| {
-            format!(
-                "Failed to delete Antigravity brain directory {}: {e}",
-                brain_dir.display()
-            )
-        })?;
-    }
-
+    // Delete auxiliary conversation artifacts first and keep the transcript-bearing
+    // brain directory as the final discovery entry. If an auxiliary deletion fails,
+    // the session remains visible and the user can retry, matching OpenCode's
+    // deletion ordering.
     let conversation_base = root.join("conversations").join(session_id);
     for suffix in ["db", "db-shm", "db-wal", "pb"] {
         let file = conversation_base.with_extension(suffix);
@@ -386,6 +380,16 @@ fn delete_antigravity_session(root: &Path, path: &Path, session_id: &str) -> Res
                 )
             })?;
         }
+    }
+
+    let brain_dir = root.join("brain").join(session_id);
+    if brain_dir.exists() {
+        std::fs::remove_dir_all(&brain_dir).map_err(|e| {
+            format!(
+                "Failed to delete Antigravity brain directory {}: {e}",
+                brain_dir.display()
+            )
+        })?;
     }
 
     Ok(true)
@@ -482,5 +486,33 @@ mod tests {
 
         let content = "visible\n<ADDITIONAL_METADATA>secret</ADDITIONAL_METADATA>";
         assert_eq!(clean_antigravity_content(content.to_string()), "visible");
+    }
+
+    #[test]
+    fn delete_antigravity_session_keeps_brain_when_conversation_cleanup_fails() {
+        let temp = tempdir().expect("tempdir");
+        let session_id = "agy-session-123";
+        let transcript = temp
+            .path()
+            .join("brain")
+            .join(session_id)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("create brain");
+        std::fs::write(&transcript, "{}\n").expect("write transcript");
+
+        // A directory at the expected .db path makes remove_file fail reliably.
+        let blocking_db = temp
+            .path()
+            .join("conversations")
+            .join(format!("{session_id}.db"));
+        std::fs::create_dir_all(&blocking_db).expect("create blocking db directory");
+
+        delete_antigravity_session(temp.path(), &transcript, session_id)
+            .expect_err("conversation cleanup should fail");
+
+        assert!(transcript.is_file(), "brain transcript must remain retryable");
     }
 }
