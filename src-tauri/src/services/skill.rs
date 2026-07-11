@@ -572,7 +572,8 @@ impl SkillService {
     /// 对于 Gemini：
     /// - `~/.gemini/skills/` 是 gemini-cli 的专属 Skill 目录，始终保留以确保向后兼容。
     /// - `~/.gemini/config/skills/` 是 Antigravity (agy) 三个客户端共享的通用 Skill
-    ///   目录；检测到 agy 环境时，写入/链接/删除只处理这个通用目录。
+    ///   目录。开启 Gemini 的 Skill 同步后，它与 `~/.gemini/skills/` 都是 CC
+    ///   Switch 的受管投影目录：检测到 agy 环境时会在此写入、更新和删除受管 Skill。
     /// - `~/.gemini/antigravity*/skills/` 是各 agy 客户端维护的私有目录。它们只作为
     ///   扫描/导入来源，不作为 CC Switch 的写入或删除目标，避免误删客户端私有状态。
     pub fn get_app_skills_dirs(app: &AppType) -> Result<Vec<PathBuf>> {
