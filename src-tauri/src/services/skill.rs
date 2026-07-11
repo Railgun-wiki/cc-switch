@@ -1712,6 +1712,9 @@ impl SkillService {
             ));
         }
 
+        // Gemini 的多个投影目标彼此独立；只要至少一个目标可用，
+        // 就保留已完成的同步并将本次操作视为成功，避免单个客户端目录故障
+        // 回滚或阻断其他客户端已经可用的 Skill。
         log::warn!(
             "Skill 多目录同步部分失败: skill={directory}, app=gemini, succeeded={success_count}, failed={}, failures=[{failure_summary}]",
             failures.len()
@@ -1883,6 +1886,8 @@ impl SkillService {
 
         // 删除与写入保持同一口径：只清理 CC Switch 管理的实际投影目标，
         // 不触碰仅用于扫描/导入的 Antigravity 私有 Skill 目录。
+        // 删除采用 fail-fast；任一受管目标清理失败时立即向上层
+        // 报错，避免在未能完整确认清理结果的情况下报告禁用/卸载成功。
         for app_dir in Self::get_app_skills_dirs(app)? {
             let skill_path = app_dir.join(directory);
             if skill_path.exists() || Self::is_symlink(&skill_path) {
