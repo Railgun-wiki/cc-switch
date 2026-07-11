@@ -2936,15 +2936,21 @@ mod tests {
         assert_eq!(db.backfill_missing_usage_costs()?, 1);
 
         let conn = lock_conn!(db.conn);
-        let (input_cost, cache_read_cost, total_cost): (String, String, String) = conn.query_row(
-            "SELECT input_cost_usd, cache_read_cost_usd, total_cost_usd
+        let (input_cost, output_cost, cache_read_cost, total_cost): (
+            String,
+            String,
+            String,
+            String,
+        ) = conn.query_row(
+            "SELECT input_cost_usd, output_cost_usd, cache_read_cost_usd, total_cost_usd
              FROM proxy_request_logs WHERE request_id = 'antigravity-cache-fresh-input'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         assert_eq!(input_cost, "0.001000");
+        assert_eq!(output_cost, "0.000500");
         assert_eq!(cache_read_cost, "0.000200");
-        assert_eq!(total_cost, "0.001200");
+        assert_eq!(total_cost, "0.001700");
 
         Ok(())
     }
