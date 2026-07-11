@@ -2942,9 +2942,9 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        assert_eq!(input_cost, "0.000100");
+        assert_eq!(input_cost, "0.001000");
         assert_eq!(cache_read_cost, "0.000200");
-        assert_eq!(total_cost, "0.000300");
+        assert_eq!(total_cost, "0.001200");
 
         Ok(())
     }
