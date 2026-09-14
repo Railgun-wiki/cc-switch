@@ -214,6 +214,7 @@ fn provider_name_coalesce(log_alias: &str, provider_alias: &str) -> String {
          WHEN '_session' THEN 'Claude (Session)' \
          WHEN '_codex_session' THEN 'Codex (Session)' \
          WHEN '_gemini_session' THEN 'Gemini (Session)' \
+         WHEN '_gemini_antigravity_session' THEN 'Antigravity (Session)' \
          WHEN '_opencode_session' THEN 'OpenCode (Session)' \
          WHEN '_grok_session' THEN 'Grok Build (Session)' \
          WHEN '_pi_session' THEN 'Pi (Session)' \
@@ -310,7 +311,7 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
         dedup_app_type_match_sql("proxy_dedup.app_type", &format!("{log_alias}.app_type"));
     format!(
         "NOT (
-            {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'opencode_session')
+            {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'opencode_session', 'antigravity_session')
             AND EXISTS (
                 SELECT 1
                 FROM proxy_request_logs proxy_dedup
@@ -325,7 +326,7 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
                       proxy_dedup.cache_creation_tokens = {log_alias}.cache_creation_tokens
                       OR (
                           {log_alias}.cache_creation_tokens = 0
-                          AND {data_source} IN ('codex_session', 'gemini_session', 'opencode_session')
+                          AND {data_source} IN ('codex_session', 'gemini_session', 'opencode_session', 'antigravity_session')
                       )
                   )
                   AND proxy_dedup.created_at BETWEEN
@@ -3948,6 +3949,42 @@ mod tests {
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].provider_id, "_opencode_session");
         assert_eq!(stats[0].provider_name, "OpenCode (Session)");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_provider_stats_labels_gemini_antigravity_session_provider() -> Result<(), AppError>
+    {
+        let db = Database::memory()?;
+
+        {
+            let conn = lock_conn!(db.conn);
+            insert_usage_log(
+                &conn,
+                "gemini-agy-session",
+                "gemini",
+                "_gemini_antigravity_session",
+                "gemini-2.5-pro",
+                "antigravity_session",
+                1000,
+                100,
+                50,
+                0,
+                0,
+                200,
+                "0.01",
+            )?;
+        }
+
+        let stats = db.get_provider_stats(None, None, Some("gemini"), None, None)?;
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].provider_id, "_gemini_antigravity_session");
+        assert_eq!(stats[0].provider_name, "Antigravity (Session)");
+
+        let summary =
+            db.get_usage_summary(None, None, None, Some("Antigravity (Session)"), None)?;
+        assert_eq!(summary.total_requests, 1);
 
         Ok(())
     }
