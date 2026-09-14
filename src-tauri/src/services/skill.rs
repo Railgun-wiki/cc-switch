@@ -6137,11 +6137,15 @@ mod tests {
         let dirs =
             SkillService::get_app_skills_dirs(&AppType::Gemini).expect("gemini dirs resolve");
 
+        let expected_cli_suffix = Path::new(".gemini").join("skills");
+        let expected_agy_suffix = Path::new(".gemini").join("config").join("skills");
         if SkillService::is_agy_active() {
             assert_eq!(dirs.len(), 2);
+            assert!(dirs.iter().any(|d| d.ends_with(&expected_cli_suffix)));
+            assert!(dirs.iter().any(|d| d.ends_with(&expected_agy_suffix)));
         } else {
             assert_eq!(dirs.len(), 1);
-            assert!(dirs[0].to_string_lossy().ends_with(".gemini/skills"));
+            assert!(dirs[0].ends_with(&expected_cli_suffix));
         }
     }
 
