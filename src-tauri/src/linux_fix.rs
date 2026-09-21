@@ -39,6 +39,14 @@ const REALIZE_WAIT: Duration = Duration::from_millis(200);
 /// 状态切换微调间隔（~30ms，覆盖 1~2 个显示刷新周期）。
 const TOGGLE_GAP: Duration = Duration::from_millis(30);
 
+/// 伪 resize 两步之间的间隔，确保 GTK 先处理了第一次 size_allocate 再收到第二次 resize。
+/// Tao 在 Linux 上的尺寸 API 是异步的（底层走 gtk_window_resize → 合成器 configure），
+/// 间隔过短可能导致合成器把两次连续 resize 合并或丢弃。
+const RESIZE_GAP: Duration = Duration::from_millis(100);
+
+/// 尺寸对账回读前的额外等待，确保合成器处理完 resize 消息队列。
+const RECONCILE_WAIT: Duration = Duration::from_millis(400);
+
 /// 尝试获取 nudge 执行权（若已有任务在执行则返回 false 阻止并发竞争）
 fn try_acquire_nudge() -> bool {
     IS_NUDGING
@@ -59,6 +67,11 @@ fn calculate_nudge_sizes(
     let logical = physical.to_logical::<f64>(scale);
     let bumped = LogicalSize::new(logical.width + 1.0, logical.height);
     (logical, bumped)
+}
+
+/// 检查当前尺寸是否与期望尺寸发生漂移（漂移大于等于 0.5 逻辑像素）
+fn has_size_drift(current: LogicalSize<f64>, expected: LogicalSize<f64>) -> bool {
+    (current.width - expected.width).abs() >= 0.5 || (current.height - expected.height).abs() >= 0.5
 }
 
 // 使用 RAII Guard 确保退出任务时总能释放互斥标志
@@ -115,8 +128,42 @@ pub(crate) fn nudge_main_window(window: WebviewWindow, reason: &'static str) {
             if let (Ok(physical), Ok(scale)) = (window.inner_size(), window.scale_factor()) {
                 let (logical, bumped) = calculate_nudge_sizes(physical, scale);
                 let _ = window.set_size(bumped);
-                tokio::time::sleep(TOGGLE_GAP).await;
+                tokio::time::sleep(RESIZE_GAP).await;
                 let _ = window.set_size(logical);
+
+                // 尺寸对账回读：Tao Linux 的尺寸 API 是异步的，`set_size` 只是把 resize 请求送进
+                // GTK 主循环队列，合成器可能会 coalesce 两次连续请求（尤其是第二次 `set_size(logical)`），
+                // 导致窗口永久停留在 width+1。这里等合成器处理完队列后读一次实际尺寸，发现 drift 就
+                // 再补一次 `set_size(logical)` 兜底。
+                tokio::time::sleep(RECONCILE_WAIT).await;
+                if let (Ok(after_physical), Ok(after_scale)) =
+                    (window.inner_size(), window.scale_factor())
+                {
+                    let after_scale = if after_scale > 0.0 { after_scale } else { 1.0 };
+                    let after_logical = after_physical.to_logical::<f64>(after_scale);
+                    if has_size_drift(after_logical, logical) {
+                        log::info!(
+                            "Linux nudge 尺寸 drift: expected={:?}, got={:?}，已补偿",
+                            logical,
+                            after_logical
+                        );
+                        let _ = window.set_size(logical);
+
+                        if let (Ok(final_physical), Ok(final_scale)) =
+                            (window.inner_size(), window.scale_factor())
+                        {
+                            let final_scale = if final_scale > 0.0 { final_scale } else { 1.0 };
+                            let final_logical = final_physical.to_logical::<f64>(final_scale);
+                            if has_size_drift(final_logical, logical) {
+                                log::warn!(
+                                    "Linux nudge 尺寸 drift 补偿后仍不一致: expected={:?}, got={:?}",
+                                    logical,
+                                    final_logical
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -176,5 +223,14 @@ mod tests {
         let (logical, bumped) = calculate_nudge_sizes(PhysicalSize::new(800, 600), 0.0);
         assert_eq!(logical.width, 800.0);
         assert_eq!(bumped.width, 801.0);
+    }
+
+    #[test]
+    fn test_has_size_drift() {
+        let expected = LogicalSize::new(800.0, 600.0);
+        assert!(!has_size_drift(LogicalSize::new(800.0, 600.0), expected));
+        assert!(!has_size_drift(LogicalSize::new(800.3, 600.2), expected));
+        assert!(has_size_drift(LogicalSize::new(801.0, 600.0), expected));
+        assert!(has_size_drift(LogicalSize::new(800.0, 601.0), expected));
     }
 }
