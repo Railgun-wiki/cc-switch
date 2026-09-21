@@ -27,11 +27,16 @@
 //!    `set_size` 无效且会引发 drift 告警与合成器重绘抖动）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tauri::{LogicalSize, WebviewWindow};
 
 static IS_NUDGING: AtomicBool = AtomicBool::new(false);
+
+/// 只保留最新一次 nudge 请求。轻量模式销毁重建窗口时，旧任务仍在跑，
+/// 新窗口的请求必须覆盖排队，而不是被互斥直接丢掉。
+static PENDING_NUDGE: LatestSlot<PendingNudge> = LatestSlot::new();
 
 /// 在 webview realize 之后的延迟，等 GTK 主循环把 realize 事件处理完。
 const REALIZE_WAIT: Duration = Duration::from_millis(200);
@@ -46,6 +51,42 @@ const RESIZE_GAP: Duration = Duration::from_millis(100);
 
 /// 尺寸对账回读前的额外等待，确保合成器处理完 resize 消息队列。
 const RECONCILE_WAIT: Duration = Duration::from_millis(400);
+
+struct PendingNudge {
+    window: WebviewWindow,
+    reason: &'static str,
+}
+
+/// 覆盖式槽：并发写入只保留最新值，供当前 nudge 任务结束后取出。
+struct LatestSlot<T> {
+    inner: Mutex<Option<T>>,
+}
+
+impl<T> LatestSlot<T> {
+    const fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    fn store(&self, value: T) {
+        *self.lock() = Some(value);
+    }
+
+    fn take(&self) -> Option<T> {
+        self.lock().take()
+    }
+
+    fn has(&self) -> bool {
+        self.lock().is_some()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<T>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 /// 尝试获取 nudge 执行权（若已有任务在执行则返回 false 阻止并发竞争）
 fn try_acquire_nudge() -> bool {
@@ -74,6 +115,10 @@ fn has_size_drift(current: LogicalSize<f64>, expected: LogicalSize<f64>) -> bool
     (current.width - expected.width).abs() >= 0.5 || (current.height - expected.height).abs() >= 0.5
 }
 
+fn is_window_alive(window: &WebviewWindow) -> bool {
+    window.is_visible().is_ok()
+}
+
 // 使用 RAII Guard 确保退出任务时总能释放互斥标志
 struct NudgeGuard;
 impl Drop for NudgeGuard {
@@ -84,94 +129,126 @@ impl Drop for NudgeGuard {
 
 /// 对主窗口执行 Linux 专用的「focus + surface 重激活」序列。
 ///
-/// 调用是 fire-and-forget：内部 spawn 一个异步任务并在防抖互斥保护下完成。
-/// 调用线程立即返回，不阻塞 UI。`reason` 标识触发来源（如 startup, deeplink 等），用于日志追踪与排障。
+/// 调用是 fire-and-forget：内部 spawn 一个异步任务并立即返回，不阻塞 UI。
+/// `reason` 标识触发来源（如 startup, deeplink 等），用于日志追踪与排障。
+///
+/// 同一时刻只跑一条序列，避免 GTK 尺寸/装饰 API 并发竞争。后续请求会覆盖排队，
+/// 当前序列结束后对最新窗口再跑一遍——轻量模式销毁重建时，替换窗口仍能拿到
+/// delayed resizable/resize 修复。
 pub(crate) fn nudge_main_window(window: WebviewWindow, reason: &'static str) {
     // 第一次 set_focus：webview 可能还没 realize，这一次通常成本极低，顺手做掉。
     let _ = window.set_focus();
+    PENDING_NUDGE.store(PendingNudge { window, reason });
 
-    // 防抖互斥：若当前已有 nudge 任务正在进行，直接返回，避免连续事件引发并发竞争。
     if !try_acquire_nudge() {
-        log::debug!("Linux: 正在执行主窗口重激活，跳过并发请求 (reason: {reason})");
+        log::debug!("Linux: 正在执行主窗口重激活，已排队最新请求 (reason: {reason})");
         return;
     }
 
     tauri::async_runtime::spawn(async move {
-        let _guard = NudgeGuard;
+        loop {
+            {
+                let _guard = NudgeGuard;
+                while let Some(PendingNudge { window, reason }) = PENDING_NUDGE.take() {
+                    run_nudge_sequence(window, reason).await;
+                }
+            }
+            // Guard 已释放 IS_NUDGING。若释放窗口期内又有请求入队，重新抢执行权；
+            // 抢不到说明另一个 runner 已经接手。
+            if !PENDING_NUDGE.has() {
+                break;
+            }
+            if !try_acquire_nudge() {
+                break;
+            }
+        }
+    });
+}
 
-        tokio::time::sleep(REALIZE_WAIT).await;
+async fn run_nudge_sequence(window: WebviewWindow, reason: &'static str) {
+    // 轻量模式可能已经销毁了排队时的旧窗口；跳过以免空耗 ~730ms。
+    if !is_window_alive(&window) {
+        log::debug!("Linux: 窗口已销毁，跳过重激活 (reason: {reason})");
+        return;
+    }
 
-        // 第二次 set_focus：此时 webview realize 已完成，消除失效模式 A。
-        let _ = window.set_focus();
+    tokio::time::sleep(REALIZE_WAIT).await;
 
-        let is_maximized = window.is_maximized().unwrap_or(false);
+    if !is_window_alive(&window) {
+        log::debug!("Linux: 窗口在等待 realize 期间被销毁，跳过重激活 (reason: {reason})");
+        return;
+    }
 
-        // 1. 修复 GTK HeaderBar 按钮输入路由：
-        // TODO: 临时规避方案。当前通过微秒级翻转 set_resizable 触发 Tao 底层重新排布 HeaderBar，
-        // 属于业务层的通融解法。长期彻底解法应向上游 Tao 提交修复，在 set_visible 或 map-event
-        // 中由底层框架自动重挂载装饰层事件路由；或者在前端采用全自绘标题栏替代 GTK 原生 HeaderBar。
-        //
-        // 在 Wayland 下，Tao 的 WlHeader 通过 connect_resizable_notify 监听 resizable 变化
-        // 并在变化时调用 header.set_decoration_layout 重建并重新挂载窗口控制按钮。
-        // 通过短暂翻转 resizable 状态，GTK 会就地销毁并以正确的 Wayland
-        // 子表面事件掩码重新构建最小化、最大化和关闭按钮。
-        // 这一过程完全不改变窗口尺寸与最大化状态，肉眼完全无感知，彻底杜绝窗口抽搐闪烁。
-        let is_resizable = window.is_resizable().unwrap_or(true);
-        let _ = window.set_resizable(!is_resizable);
-        tokio::time::sleep(TOGGLE_GAP).await;
-        let _ = window.set_resizable(is_resizable);
+    // 第二次 set_focus：此时 webview realize 已完成，消除失效模式 A。
+    let _ = window.set_focus();
 
-        // 2. 修复 WebKitWebView input region 协商问题 (失效模式 B)：
-        // 仅在非最大化窗口下执行微调（以 LogicalSize 为基准，避免 HiDPI 下物理像素截断为 0）。
-        // 最大化窗口尺寸受合成器硬约束，严禁调用 set_size，否则会引发 drift 告警与画面撕裂。
-        if !is_maximized {
-            if let (Ok(physical), Ok(scale)) = (window.inner_size(), window.scale_factor()) {
-                let (logical, bumped) = calculate_nudge_sizes(physical, scale);
-                let _ = window.set_size(bumped);
-                tokio::time::sleep(RESIZE_GAP).await;
-                let _ = window.set_size(logical);
+    let is_maximized = window.is_maximized().unwrap_or(false);
 
-                // 尺寸对账回读：Tao Linux 的尺寸 API 是异步的，`set_size` 只是把 resize 请求送进
-                // GTK 主循环队列，合成器可能会 coalesce 两次连续请求（尤其是第二次 `set_size(logical)`），
-                // 导致窗口永久停留在 width+1。这里等合成器处理完队列后读一次实际尺寸，发现 drift 就
-                // 再补一次 `set_size(logical)` 兜底。
-                tokio::time::sleep(RECONCILE_WAIT).await;
-                if let (Ok(after_physical), Ok(after_scale)) =
-                    (window.inner_size(), window.scale_factor())
-                {
-                    let after_scale = if after_scale > 0.0 { after_scale } else { 1.0 };
-                    let after_logical = after_physical.to_logical::<f64>(after_scale);
-                    if has_size_drift(after_logical, logical) {
-                        log::info!(
-                            "Linux nudge 尺寸 drift: expected={:?}, got={:?}，已补偿",
-                            logical,
-                            after_logical
-                        );
-                        let _ = window.set_size(logical);
+    // 1. 修复 GTK HeaderBar 按钮输入路由：
+    // TODO: 临时规避方案。当前通过微秒级翻转 set_resizable 触发 Tao 底层重新排布 HeaderBar，
+    // 属于业务层的通融解法。长期彻底解法应向上游 Tao 提交修复，在 set_visible 或 map-event
+    // 中由底层框架自动重挂载装饰层事件路由；或者在前端采用全自绘标题栏替代 GTK 原生 HeaderBar。
+    //
+    // 在 Wayland 下，Tao 的 WlHeader 通过 connect_resizable_notify 监听 resizable 变化
+    // 并在变化时调用 header.set_decoration_layout 重建并重新挂载窗口控制按钮。
+    // 通过短暂翻转 resizable 状态，GTK 会就地销毁并以正确的 Wayland
+    // 子表面事件掩码重新构建最小化、最大化和关闭按钮。
+    // 这一过程完全不改变窗口尺寸与最大化状态，肉眼完全无感知，彻底杜绝窗口抽搐闪烁。
+    let is_resizable = window.is_resizable().unwrap_or(true);
+    let _ = window.set_resizable(!is_resizable);
+    tokio::time::sleep(TOGGLE_GAP).await;
+    let _ = window.set_resizable(is_resizable);
 
-                        if let (Ok(final_physical), Ok(final_scale)) =
-                            (window.inner_size(), window.scale_factor())
-                        {
-                            let final_scale = if final_scale > 0.0 { final_scale } else { 1.0 };
-                            let final_logical = final_physical.to_logical::<f64>(final_scale);
-                            if has_size_drift(final_logical, logical) {
-                                log::warn!(
-                                    "Linux nudge 尺寸 drift 补偿后仍不一致: expected={:?}, got={:?}",
-                                    logical,
-                                    final_logical
-                                );
-                            }
+    // 2. 修复 WebKitWebView input region 协商问题 (失效模式 B)：
+    // 仅在非最大化窗口下执行微调（以 LogicalSize 为基准，避免 HiDPI 下物理像素截断为 0）。
+    // 最大化窗口尺寸受合成器硬约束，严禁调用 set_size，否则会引发 drift 告警与画面撕裂。
+    if !is_maximized {
+        if let (Ok(physical), Ok(scale)) = (window.inner_size(), window.scale_factor()) {
+            let (logical, bumped) = calculate_nudge_sizes(physical, scale);
+            let _ = window.set_size(bumped);
+            tokio::time::sleep(RESIZE_GAP).await;
+            let _ = window.set_size(logical);
+
+            // 尺寸对账回读：Tao Linux 的尺寸 API 是异步的，`set_size` 只是把 resize 请求送进
+            // GTK 主循环队列，合成器可能会 coalesce 两次连续请求（尤其是第二次 `set_size(logical)`），
+            // 导致窗口永久停留在 width+1。这里等合成器处理完队列后读一次实际尺寸，发现 drift 就
+            // 再补一次 `set_size(logical)` 兜底。
+            tokio::time::sleep(RECONCILE_WAIT).await;
+            if let (Ok(after_physical), Ok(after_scale)) =
+                (window.inner_size(), window.scale_factor())
+            {
+                let after_scale = if after_scale > 0.0 { after_scale } else { 1.0 };
+                let after_logical = after_physical.to_logical::<f64>(after_scale);
+                if has_size_drift(after_logical, logical) {
+                    log::info!(
+                        "Linux nudge 尺寸 drift: expected={:?}, got={:?}，已补偿",
+                        logical,
+                        after_logical
+                    );
+                    let _ = window.set_size(logical);
+
+                    if let (Ok(final_physical), Ok(final_scale)) =
+                        (window.inner_size(), window.scale_factor())
+                    {
+                        let final_scale = if final_scale > 0.0 { final_scale } else { 1.0 };
+                        let final_logical = final_physical.to_logical::<f64>(final_scale);
+                        if has_size_drift(final_logical, logical) {
+                            log::warn!(
+                                "Linux nudge 尺寸 drift 补偿后仍不一致: expected={:?}, got={:?}",
+                                logical,
+                                final_logical
+                            );
                         }
                     }
                 }
             }
         }
+    }
 
-        let _ = window.set_focus();
-        log::info!(
-            "Linux: 已对主窗口执行 focus + HeaderBar 控制按钮与 surface 重激活 (reason: {reason}, maximized={is_maximized})"
-        );
-    });
+    let _ = window.set_focus();
+    log::info!(
+        "Linux: 已对主窗口执行 focus + HeaderBar 控制按钮与 surface 重激活 (reason: {reason}, maximized={is_maximized})"
+    );
 }
 
 #[cfg(test)]
@@ -197,6 +274,17 @@ mod tests {
         // 释放后应能再次成功获取
         assert!(try_acquire_nudge());
         IS_NUDGING.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_latest_slot_keeps_newest_while_busy() {
+        let slot = LatestSlot::new();
+        slot.store("destroyed-window");
+        slot.store("replacement-window");
+        assert!(slot.has());
+        assert_eq!(slot.take(), Some("replacement-window"));
+        assert!(!slot.has());
+        assert_eq!(slot.take(), None);
     }
 
     #[test]
