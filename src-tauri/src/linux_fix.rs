@@ -39,6 +39,36 @@ const REALIZE_WAIT: Duration = Duration::from_millis(200);
 /// 状态切换微调间隔（~30ms，覆盖 1~2 个显示刷新周期）。
 const TOGGLE_GAP: Duration = Duration::from_millis(30);
 
+/// 尝试获取 nudge 执行权（若已有任务在执行则返回 false 阻止并发竞争）
+fn try_acquire_nudge() -> bool {
+    IS_NUDGING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+/// 计算微调逻辑尺寸，以 LogicalSize 为基准，避免在 HiDPI 缩放下发生物理像素截断为 0 的问题
+fn calculate_nudge_sizes(
+    physical: tauri::PhysicalSize<u32>,
+    scale_factor: f64,
+) -> (LogicalSize<f64>, LogicalSize<f64>) {
+    let scale = if scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let logical = physical.to_logical::<f64>(scale);
+    let bumped = LogicalSize::new(logical.width + 1.0, logical.height);
+    (logical, bumped)
+}
+
+// 使用 RAII Guard 确保退出任务时总能释放互斥标志
+struct NudgeGuard;
+impl Drop for NudgeGuard {
+    fn drop(&mut self) {
+        IS_NUDGING.store(false, Ordering::SeqCst);
+    }
+}
+
 /// 对主窗口执行 Linux 专用的「focus + surface 重激活」序列。
 ///
 /// 调用是 fire-and-forget：内部 spawn 一个异步任务并在防抖互斥保护下完成。
@@ -48,22 +78,12 @@ pub(crate) fn nudge_main_window(window: WebviewWindow, reason: &'static str) {
     let _ = window.set_focus();
 
     // 防抖互斥：若当前已有 nudge 任务正在进行，直接返回，避免连续事件引发并发竞争。
-    if IS_NUDGING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    if !try_acquire_nudge() {
         log::debug!("Linux: 正在执行主窗口重激活，跳过并发请求 (reason: {reason})");
         return;
     }
 
     tauri::async_runtime::spawn(async move {
-        // 使用 RAII Guard 确保退出任务时总能释放互斥标志
-        struct NudgeGuard;
-        impl Drop for NudgeGuard {
-            fn drop(&mut self) {
-                IS_NUDGING.store(false, Ordering::SeqCst);
-            }
-        }
         let _guard = NudgeGuard;
 
         tokio::time::sleep(REALIZE_WAIT).await;
@@ -93,9 +113,7 @@ pub(crate) fn nudge_main_window(window: WebviewWindow, reason: &'static str) {
         // 最大化窗口尺寸受合成器硬约束，严禁调用 set_size，否则会引发 drift 告警与画面撕裂。
         if !is_maximized {
             if let (Ok(physical), Ok(scale)) = (window.inner_size(), window.scale_factor()) {
-                let scale = if scale > 0.0 { scale } else { 1.0 };
-                let logical = physical.to_logical::<f64>(scale);
-                let bumped = LogicalSize::new(logical.width + 1.0, logical.height);
+                let (logical, bumped) = calculate_nudge_sizes(physical, scale);
                 let _ = window.set_size(bumped);
                 tokio::time::sleep(TOGGLE_GAP).await;
                 let _ = window.set_size(logical);
@@ -107,4 +125,56 @@ pub(crate) fn nudge_main_window(window: WebviewWindow, reason: &'static str) {
             "Linux: 已对主窗口执行 focus + HeaderBar 控制按钮与 surface 重激活 (reason: {reason}, maximized={is_maximized})"
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauri::PhysicalSize;
+
+    #[test]
+    fn test_try_acquire_nudge_concurrency_guard() {
+        // 初始状态下应该可以成功获取
+        IS_NUDGING.store(false, Ordering::SeqCst);
+        assert!(try_acquire_nudge());
+
+        // 已持有时再次尝试应该失败（防抖互斥）
+        assert!(!try_acquire_nudge());
+
+        // 模拟 Guard drop 释放互斥标志
+        {
+            let _guard = NudgeGuard;
+        }
+        assert!(!IS_NUDGING.load(Ordering::SeqCst));
+
+        // 释放后应能再次成功获取
+        assert!(try_acquire_nudge());
+        IS_NUDGING.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_calculate_nudge_sizes_various_hidpi_scales() {
+        // 标准 1.0x 缩放
+        let (logical, bumped) = calculate_nudge_sizes(PhysicalSize::new(800, 600), 1.0);
+        assert_eq!(logical.width, 800.0);
+        assert_eq!(bumped.width, 801.0);
+        assert_eq!(bumped.height, 600.0);
+
+        // HiDPI 1.25x 缩放
+        let (logical, bumped) = calculate_nudge_sizes(PhysicalSize::new(1000, 750), 1.25);
+        assert_eq!(logical.width, 800.0);
+        assert_eq!(bumped.width, 801.0);
+        assert!((bumped.width - logical.width - 1.0).abs() < 1e-6);
+
+        // HiDPI 2.0x 缩放
+        let (logical, bumped) = calculate_nudge_sizes(PhysicalSize::new(1600, 1200), 2.0);
+        assert_eq!(logical.width, 800.0);
+        assert_eq!(bumped.width, 801.0);
+        assert_eq!(bumped.height, 600.0);
+
+        // 异常 scale (<= 0) 回退到 1.0
+        let (logical, bumped) = calculate_nudge_sizes(PhysicalSize::new(800, 600), 0.0);
+        assert_eq!(logical.width, 800.0);
+        assert_eq!(bumped.width, 801.0);
+    }
 }
