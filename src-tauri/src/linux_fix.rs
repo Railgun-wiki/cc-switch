@@ -42,8 +42,8 @@ const TOGGLE_GAP: Duration = Duration::from_millis(30);
 /// 对主窗口执行 Linux 专用的「focus + surface 重激活」序列。
 ///
 /// 调用是 fire-and-forget：内部 spawn 一个异步任务并在防抖互斥保护下完成。
-/// 调用线程立即返回，不阻塞 UI。
-pub(crate) fn nudge_main_window(window: WebviewWindow) {
+/// 调用线程立即返回，不阻塞 UI。`reason` 标识触发来源（如 startup, deeplink 等），用于日志追踪与排障。
+pub(crate) fn nudge_main_window(window: WebviewWindow, reason: &'static str) {
     // 第一次 set_focus：webview 可能还没 realize，这一次通常成本极低，顺手做掉。
     let _ = window.set_focus();
 
@@ -52,6 +52,7 @@ pub(crate) fn nudge_main_window(window: WebviewWindow) {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
+        log::debug!("Linux: 正在执行主窗口重激活，跳过并发请求 (reason: {reason})");
         return;
     }
 
@@ -103,7 +104,7 @@ pub(crate) fn nudge_main_window(window: WebviewWindow) {
 
         let _ = window.set_focus();
         log::info!(
-            "Linux: 已对主窗口执行 focus + HeaderBar 控制按钮与 surface 重激活 (maximized={is_maximized})"
+            "Linux: 已对主窗口执行 focus + HeaderBar 控制按钮与 surface 重激活 (reason: {reason}, maximized={is_maximized})"
         );
     });
 }
