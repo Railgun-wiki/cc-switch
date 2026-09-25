@@ -63,6 +63,7 @@ const TOOL_NAMES = [
   "claude",
   "codex",
   "gemini",
+  "antigravity",
   "grok",
   "opencode",
   "openclaw",
@@ -111,9 +112,6 @@ const ENV_BADGE_CONFIG: Record<
 const posixScriptInstallCommand = (url: string) =>
   `bash -c 'tmp=$(mktemp) && curl -fsSL ${url} -o $tmp && bash $tmp; status=$?; rm -f $tmp; exit $status'`;
 
-const HERMES_WINDOWS_INSTALL_SCRIPT =
-  "irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex";
-
 const powershellEncodedCommand = (script: string): string => {
   let binary = "";
   for (let i = 0; i < script.length; i += 1) {
@@ -122,6 +120,16 @@ const powershellEncodedCommand = (script: string): string => {
   }
   return btoa(binary);
 };
+
+const ANTIGRAVITY_WINDOWS_INSTALL_SCRIPT =
+  "irm https://antigravity.google/cli/install.ps1 | iex";
+
+const ANTIGRAVITY_WINDOWS_INSTALL_COMMAND = `powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${powershellEncodedCommand(
+  ANTIGRAVITY_WINDOWS_INSTALL_SCRIPT,
+)}`;
+
+const HERMES_WINDOWS_INSTALL_SCRIPT =
+  "irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex";
 
 const HERMES_WINDOWS_INSTALL_COMMAND = `powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${powershellEncodedCommand(
   HERMES_WINDOWS_INSTALL_SCRIPT,
@@ -142,6 +150,8 @@ ${posixScriptInstallCommand("https://claude.ai/install.sh")} || npm i -g @anthro
 npm i -g @openai/codex@latest
 # Gemini CLI
 npm i -g @google/gemini-cli@latest
+# Antigravity
+${posixScriptInstallCommand("https://antigravity.google/cli/install.sh")}
 # Grok Build
 npm i -g @xai-official/grok@latest
 # OpenCode
@@ -161,6 +171,8 @@ npm i -g @anthropic-ai/claude-code@latest
 npm i -g @openai/codex@latest
 # Gemini CLI
 npm i -g @google/gemini-cli@latest
+# Antigravity
+${ANTIGRAVITY_WINDOWS_INSTALL_COMMAND}
 # Grok Build
 npm i -g @xai-official/grok@latest
 # OpenCode
@@ -182,6 +194,7 @@ const TOOL_DISPLAY_NAMES: Record<ToolName, string> = {
   claude: "Claude Code",
   codex: "Codex",
   gemini: "Gemini CLI",
+  antigravity: "Antigravity CLI",
   grok: "Grok Build",
   opencode: "OpenCode",
   openclaw: "OpenClaw",
@@ -200,6 +213,7 @@ const TOOL_APP_IDS: Record<ToolName, AppId> = {
   claude: "claude",
   codex: "codex",
   gemini: "gemini",
+  antigravity: "gemini",
   grok: "grokbuild",
   opencode: "opencode",
   openclaw: "openclaw",
@@ -301,6 +315,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
   const updatableToolNames = useMemo(
     () =>
       TOOL_NAMES.filter((toolName) => {
+        if (toolName === "antigravity") return false;
         const tool = toolVersionByName.get(toolName);
         return isUpdateAvailable(tool?.version, tool?.latest_version);
       }),
@@ -1317,11 +1332,11 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
                         ? t("settings.toolInstall")
                         : t("settings.toolUpdate")}
                     </Button>
-                  ) : (
+                  ) : tool?.version ? (
                     <span className="text-xs text-muted-foreground">
                       {t("settings.toolReady")}
                     </span>
-                  )}
+                  ) : null}
                 </div>
               </motion.div>
             );
