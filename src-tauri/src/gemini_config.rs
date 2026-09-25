@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+/// Antigravity keeps per-client state beneath the shared Gemini configuration root.
+pub const ANTIGRAVITY_ROOTS: &[&str] = &["antigravity", "antigravity-cli", "antigravity-ide"];
+
 /// 获取 Gemini 配置目录路径（支持设置覆盖）
 pub fn get_gemini_dir() -> PathBuf {
     if let Some(custom) = crate::settings::get_gemini_override_dir() {
