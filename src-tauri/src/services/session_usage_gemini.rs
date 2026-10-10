@@ -304,6 +304,7 @@ fn insert_gemini_session_entry(
         output_tokens,
         cache_read_tokens: tokens.cached,
         cache_creation_tokens: 0,
+        cache_creation_1h_tokens: 0,
         model: Some(model.to_string()),
         message_id: None,
     };
@@ -956,6 +957,7 @@ fn insert_antigravity_session_entry(
         output_tokens,
         cache_read_tokens: token_data.cached_tokens,
         cache_creation_tokens: 0,
+        cache_creation_1h_tokens: 0,
         model: Some(pricing_model.clone()),
         message_id: None,
     };
@@ -1789,11 +1791,22 @@ mod tests {
             Decimal::from(4)
         );
 
-        // 4. claude-sonnet-5.5 保留完整版本号与家族，不降级为 5 或 4.6，且由于无内置价格返回未定价 (None)
+        // 4. claude-sonnet-5.5 命中已种子官方价格 ($2.00)
         let (sonnet_55_pricing, sonnet_55_model) =
             resolve_antigravity_pricing(&conn, "claude-sonnet-5.5");
         assert_eq!(sonnet_55_model, "claude-sonnet-5-5");
-        assert!(sonnet_55_pricing.is_none(), "无官方价格条目时不得猜测价格");
+        assert_eq!(
+            sonnet_55_pricing
+                .expect("sonnet 5.5 pricing")
+                .input_cost_per_million,
+            Decimal::from(2)
+        );
+
+        // 未知版本如 claude-sonnet-5.6 保留完整版本号与家族，不降级为 5.5 或 5，且由于无内置价格返回未定价 (None)
+        let (sonnet_56_pricing, sonnet_56_model) =
+            resolve_antigravity_pricing(&conn, "claude-sonnet-5.6");
+        assert_eq!(sonnet_56_model, "claude-sonnet-5-6");
+        assert!(sonnet_56_pricing.is_none(), "无官方价格条目时不得猜测价格");
 
         // 5. 未知占位符保留原始 ID，不产生价格
         let (m999_pricing, m999_model) =
