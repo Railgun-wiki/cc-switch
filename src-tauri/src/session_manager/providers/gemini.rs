@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::session_manager::cache::Transcript;
 use crate::session_manager::model::{
     ContentRef, DiffOp, EventKind, MessageMeta, SessionBlock, ToolStatus,
 };
@@ -195,6 +196,13 @@ fn is_injected_user_text(text: &str) -> bool {
 fn read_session_document(path: &Path) -> Result<Value, String> {
     let data = std::fs::read_to_string(path).map_err(|e| format!("Failed to read session: {e}"))?;
     parse_session_document(&data).ok_or_else(|| "Failed to parse session JSON".to_string())
+}
+
+pub(crate) fn load_transcript(path: &Path) -> Result<Transcript, String> {
+    if is_antigravity_transcript(path) {
+        return load_antigravity_transcript(path);
+    }
+    load_messages(path).map(Transcript::new)
 }
 
 pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
@@ -1242,7 +1250,8 @@ fn load_antigravity_step_token_map(
     use crate::services::session_usage_gemini::{parse_gen_metadata_blob, parse_step_gen_idx};
 
     // Like the usage importer, join generation usage and step references from
-    // one read snapshot. Read failures must reach TranscriptCache so it can retry.
+    // one read snapshot. The caller must leave degraded results uncached so it
+    // can retry optional metadata without making transcript text unavailable.
     let read = || -> rusqlite::Result<_> {
         let mut conn = rusqlite::Connection::open_with_flags(
             db_path,
@@ -1291,13 +1300,23 @@ fn load_antigravity_step_token_map(
 }
 
 fn load_antigravity_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
+    load_antigravity_transcript(path).map(|transcript| transcript.messages)
+}
+
+fn load_antigravity_transcript(path: &Path) -> Result<Transcript, String> {
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read Antigravity transcript: {e}"))?;
 
-    let step_token_map = find_antigravity_db_path(path)
+    let (step_token_map, skip_cache) = match find_antigravity_db_path(path)
         .map(|db| load_antigravity_step_token_map(&db))
-        .transpose()?
-        .unwrap_or_default();
+        .transpose()
+    {
+        Ok(map) => (map.unwrap_or_default(), false),
+        Err(error) => {
+            log::warn!("{error}; loading Antigravity transcript without database metadata");
+            (HashMap::new(), true)
+        }
+    };
     let mut result = Vec::new();
 
     // Build each message once from its transcript and source DB metadata;
@@ -1386,7 +1405,9 @@ fn load_antigravity_messages(path: &Path) -> Result<Vec<SessionMessage>, String>
     }
 
     assign_turn_ids(&mut result);
-    Ok(result)
+    let mut transcript = Transcript::new(result);
+    transcript.skip_cache = skip_cache;
+    Ok(transcript)
 }
 
 fn extract_antigravity_content(value: &Value) -> String {
@@ -2064,7 +2085,7 @@ mod tests {
 
     #[test]
     fn antigravity_cached_messages_follow_database_and_wal_updates() {
-        use crate::session_manager::cache::{source_fingerprint, Transcript, TranscriptCache};
+        use crate::session_manager::cache::{source_fingerprint, TranscriptCache};
         use crate::session_manager::content::{SourceLocation, ValidatedSource};
 
         let (temp, transcript, conn) = antigravity_message_fixture();
@@ -2081,7 +2102,7 @@ mod tests {
         };
         let cache = TranscriptCache::new(8, usize::MAX);
         let key = (source.provider_id.clone(), source.raw.clone());
-        let load = || load_messages(&transcript).map(Transcript::new);
+        let load = || load_transcript(&transcript);
         let before = source_fingerprint(&source).unwrap();
         let (first, cached) = cache.get_or_load(key.clone(), before, load).unwrap();
         assert!(!cached);
@@ -2158,36 +2179,64 @@ mod tests {
 
     #[test]
     fn antigravity_metadata_read_errors_are_retried_without_caching_partial_messages() {
-        use crate::session_manager::cache::{source_fingerprint, Transcript, TranscriptCache};
+        use crate::session_manager::cache::{source_fingerprint, TranscriptCache};
         use crate::session_manager::content::{SourceLocation, ValidatedSource};
 
-        let (temp, transcript, conn) = antigravity_message_fixture();
-        let source = ValidatedSource {
-            provider_id: "gemini".into(),
-            raw: transcript.to_string_lossy().into_owned(),
-            location: SourceLocation::Path {
-                path: transcript.clone(),
-                root: temp.path().to_path_buf(),
-            },
-        };
-        let cache = TranscriptCache::new(8, usize::MAX);
-        let key = (source.provider_id.clone(), source.raw.clone());
-        // A bad row must fail the snapshot instead of flattening away the error.
-        conn.execute("UPDATE steps SET metadata = 'invalid blob'", [])
-            .unwrap();
-        let fingerprint = source_fingerprint(&source).unwrap();
-        let load = || load_messages(&transcript).map(Transcript::new);
-        assert!(cache.get_or_load(key.clone(), fingerprint, load).is_err());
-        assert!(cache.get(&key, fingerprint).is_none());
-        conn.execute("UPDATE steps SET metadata = ?1", [test_step_metadata(0)])
-            .unwrap();
-        // Reuse the same fingerprint: failure itself must leave the cache empty.
-        let (loaded, cached) = cache.get_or_load(key, fingerprint, load).unwrap();
-        assert!(!cached);
-        assert_eq!(
-            loaded.messages[1].meta.as_ref().unwrap().duration_ms,
-            Some(2500)
-        );
+        for (failure, recovery) in [
+            ("BEGIN EXCLUSIVE;", "COMMIT;"),
+            (
+                "ALTER TABLE gen_metadata RENAME TO unavailable_metadata;",
+                "ALTER TABLE unavailable_metadata RENAME TO gen_metadata;",
+            ),
+            ("UPDATE steps SET metadata = 'invalid blob';", ""),
+        ] {
+            let (temp, transcript, conn) = antigravity_message_fixture();
+            // Inline metadata must survive even when optional DB enrichment fails.
+            let text = std::fs::read_to_string(&transcript).unwrap();
+            let text = text.replace("\"Hi there!\"", "\"Hi there!\", \"input_tokens\": 7");
+            std::fs::write(&transcript, text).unwrap();
+            let source = ValidatedSource {
+                provider_id: "gemini".into(),
+                raw: transcript.to_string_lossy().into_owned(),
+                location: SourceLocation::Path {
+                    path: transcript.clone(),
+                    root: temp.path().to_path_buf(),
+                },
+            };
+            let cache = TranscriptCache::new(8, usize::MAX);
+            let key = (source.provider_id.clone(), source.raw.clone());
+            conn.execute_batch(failure).unwrap();
+            let fingerprint = source_fingerprint(&source).unwrap();
+            let load = || load_transcript(&transcript);
+            let (degraded, cached) = cache.get_or_load(key.clone(), fingerprint, load).unwrap();
+            assert!(!cached);
+            assert_eq!(degraded.messages.len(), 2);
+            assert_eq!(degraded.messages[0].content, "hello");
+            assert_eq!(degraded.messages[1].content, "Hi there!");
+            assert_eq!(
+                degraded.messages[1].meta.as_ref().unwrap().input_tokens,
+                Some(7)
+            );
+            assert_eq!(
+                degraded.messages[1].meta.as_ref().unwrap().duration_ms,
+                None
+            );
+            assert!(cache.get(&key, fingerprint).is_none());
+            // The non-cached loader must also remain usable while the DB is broken.
+            assert_eq!(load_messages(&transcript).unwrap(), degraded.messages);
+
+            conn.execute_batch(recovery).unwrap();
+            conn.execute("UPDATE steps SET metadata = ?1", [test_step_metadata(0)])
+                .unwrap();
+            // Deliberately reuse the fingerprint: unlocking need not modify the DB.
+            let (loaded, cached) = cache.get_or_load(key.clone(), fingerprint, load).unwrap();
+            assert!(!cached);
+            let meta = loaded.messages[1].meta.as_ref().unwrap();
+            assert_eq!(meta.input_tokens, Some(7));
+            assert_eq!(meta.output_tokens, Some(42));
+            assert_eq!(meta.duration_ms, Some(2500));
+            assert!(cache.get_or_load(key, fingerprint, load).unwrap().1);
+        }
     }
 
     #[test]

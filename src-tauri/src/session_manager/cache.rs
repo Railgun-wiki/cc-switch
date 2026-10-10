@@ -30,6 +30,8 @@ pub struct Transcript {
     pub approx_bytes: usize,
     /// 每条消息序列化后的字节数，流式分块时按它切包，避免重复序列化
     pub message_bytes: Vec<usize>,
+    /// 可选元数据读取失败时仍返回正文，但下次读取必须重试。
+    pub(super) skip_cache: bool,
 }
 
 impl Transcript {
@@ -45,6 +47,7 @@ impl Transcript {
             turns,
             approx_bytes,
             message_bytes,
+            skip_cache: false,
         }
     }
 }
@@ -235,7 +238,10 @@ impl TranscriptCache {
     pub fn insert(&self, key: CacheKey, fingerprint: Fingerprint, transcript: Arc<Transcript>) {
         let mut entries = self.lock();
         entries.retain(|entry| entry.key != key);
-        if transcript.approx_bytes > self.max_bytes || self.max_entries == 0 {
+        if transcript.skip_cache
+            || transcript.approx_bytes > self.max_bytes
+            || self.max_entries == 0
+        {
             return;
         }
         entries.push_back(Entry {
@@ -252,7 +258,8 @@ impl TranscriptCache {
         }
     }
 
-    /// 命中返回 `(缓存, true)`；否则调用 `load` 解析并写入，返回 `(新值, false)`。
+    /// 命中返回 `(缓存, true)`；否则调用 `load`，返回 `(新值, false)`。
+    /// 仅缓存完整结果；可选元数据失败的降级结果保留给本次读取，下次重试。
     /// 解析在锁外进行，同一会话并发打开时可能重复解析一次，但不会互相阻塞。
     pub fn get_or_load<F>(
         &self,

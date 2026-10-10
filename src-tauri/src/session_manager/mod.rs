@@ -129,7 +129,7 @@ pub struct LoadedTranscript {
 }
 
 /// 校验 `source_path` 归属后读取会话，未变化的源直接用 [`cache::TranscriptCache`]。
-/// 解析仍走上面的 [`load_messages`] 分发。
+/// 常规解析走 [`load_messages`]；Gemini 同时返回可选元数据的缓存策略。
 pub fn load_transcript(provider_id: &str, source_path: &str) -> Result<LoadedTranscript, String> {
     let started = Instant::now();
     let source = content::validate_source(provider_id, source_path)?;
@@ -137,6 +137,9 @@ pub fn load_transcript(provider_id: &str, source_path: &str) -> Result<LoadedTra
         .map_err(|e| format!("Failed to read session source: {e}"))?;
     let key = (source.provider_id.clone(), source.raw.clone());
     let (transcript, cached) = cache::global().get_or_load(key, fingerprint, || {
+        if source.provider_id == "gemini" {
+            return gemini::load_transcript(Path::new(&source.load_path()));
+        }
         load_messages(&source.provider_id, &source.load_path()).map(cache::Transcript::new)
     })?;
     Ok(LoadedTranscript {
