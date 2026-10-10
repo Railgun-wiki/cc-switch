@@ -1221,21 +1221,92 @@ fn parse_antigravity_session_with_project_dir(
     })
 }
 
+/// Reader and cache must resolve the same DB, within this transcript's root.
+/// Session IDs can occur in several Antigravity roots (for example after copying
+/// a session); another root's database must not supply this transcript's usage.
+pub(crate) fn find_antigravity_db_path(transcript_path: &Path) -> Option<PathBuf> {
+    if !is_antigravity_transcript(transcript_path) {
+        return None;
+    }
+    let (root, session_id) = find_antigravity_root_and_id_for_transcript(transcript_path)?;
+    if !is_safe_id_component(&session_id) {
+        return None;
+    }
+    let db = root.join("conversations").join(format!("{session_id}.db"));
+    db.is_file().then_some(db)
+}
+
+fn load_antigravity_step_token_map(
+    db_path: &Path,
+) -> Result<HashMap<i64, crate::services::session_usage_gemini::AntigravityTokenData>, String> {
+    use crate::services::session_usage_gemini::{parse_gen_metadata_blob, parse_step_gen_idx};
+
+    // Like the usage importer, join generation usage and step references from
+    // one read snapshot. Read failures must reach TranscriptCache so it can retry.
+    let read = || -> rusqlite::Result<_> {
+        let mut conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(500))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+        let mut gen_meta_map = HashMap::new();
+        {
+            let mut stmt = tx.prepare("SELECT idx, data FROM gen_metadata")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for row in rows {
+                let (idx, data) = row?;
+                if let Some(token_data) = parse_gen_metadata_blob(&data) {
+                    gen_meta_map.insert(idx, token_data);
+                }
+            }
+        }
+
+        let mut step_token_map = HashMap::new();
+        {
+            let mut stmt = tx.prepare("SELECT idx, metadata FROM steps")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+            })?;
+            for row in rows {
+                let (step_idx, metadata) = row?;
+                if let Some(gen_idx) = metadata.as_deref().and_then(parse_step_gen_idx) {
+                    if let Some(token_data) = gen_meta_map.get(&gen_idx) {
+                        step_token_map.insert(step_idx, token_data.clone());
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(step_token_map)
+    };
+    read().map_err(|e| {
+        format!(
+            "Failed to read Antigravity metadata {}: {e}",
+            db_path.display()
+        )
+    })
+}
+
 fn load_antigravity_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read Antigravity transcript: {e}"))?;
+
+    let step_token_map = find_antigravity_db_path(path)
+        .map(|db| load_antigravity_step_token_map(&db))
+        .transpose()?
+        .unwrap_or_default();
     let mut result = Vec::new();
 
-    for line in data.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    // Build each message once from its transcript and source DB metadata;
+    // this path never updates the usage database or backfills stored messages.
+    for line in data.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
-        }
-        let value: Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(_) => continue,
         };
-
+        let ts = parse_antigravity_timestamp(&value);
         let source = value.get("source").and_then(Value::as_str);
         let message_type = value.get("type").and_then(Value::as_str);
         let role = match (source, message_type) {
@@ -1249,12 +1320,68 @@ fn load_antigravity_messages(path: &Path) -> Result<Vec<SessionMessage>, String>
             continue;
         }
 
-        let ts = parse_antigravity_timestamp(&value);
         let mut message = SessionMessage::from_blocks(role, ts, vec![SessionBlock::text(content)]);
-        message.id = value
-            .get("step_index")
-            .and_then(|v| v.as_i64())
-            .map(|n| n.to_string());
+        let step_index = value.get("step_index").and_then(|v| v.as_i64());
+        message.id = step_index.map(|n| n.to_string());
+
+        let mut input_tokens = value.get("input_tokens").and_then(Value::as_u64);
+        let mut output_tokens = value.get("output_tokens").and_then(Value::as_u64);
+        let mut cache_read = value.get("cache_read_tokens").and_then(Value::as_u64);
+        let mut duration_ms = value
+            .get("duration_ms")
+            .and_then(Value::as_u64)
+            .filter(|d| *d > 0 && *d <= 3_600_000);
+        let mut model = value
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        if role == "assistant" {
+            if let Some(step_idx) = step_index {
+                if let Some(token_data) = step_token_map.get(&step_idx) {
+                    if input_tokens.is_none() && token_data.input_tokens > 0 {
+                        input_tokens = Some(token_data.input_tokens as u64);
+                    }
+                    if output_tokens.is_none() && token_data.output_tokens > 0 {
+                        output_tokens = Some(token_data.output_tokens as u64);
+                    }
+                    if cache_read.is_none() && token_data.cached_tokens > 0 {
+                        cache_read = Some(token_data.cached_tokens as u64);
+                    }
+                    if duration_ms.is_none() {
+                        if let Some(d) = token_data.duration_ms {
+                            if d > 0 && d <= 3_600_000 {
+                                duration_ms = Some(d as u64);
+                            }
+                        }
+                    }
+                    if model.is_none()
+                        && !token_data.model.is_empty()
+                        && token_data.model != "unknown"
+                    {
+                        model = Some(token_data.model.clone());
+                    }
+                }
+            }
+        }
+
+        if input_tokens.is_some()
+            || output_tokens.is_some()
+            || cache_read.is_some()
+            || duration_ms.is_some()
+            || model.is_some()
+        {
+            message.meta = Some(MessageMeta {
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens: cache_read,
+                duration_ms,
+                ..Default::default()
+            });
+        }
+
         result.push(message);
     }
 
@@ -1793,6 +1920,341 @@ mod tests {
         assert!(!db_file.exists());
         assert!(!meta_file.exists());
         assert!(!temp.path().join("brain").join(session_id).exists());
+    }
+
+    fn test_proto_varint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn test_proto_varint_field(field: u32, value: u64) -> Vec<u8> {
+        let mut out = test_proto_varint((field as u64) << 3);
+        out.extend(test_proto_varint(value));
+        out
+    }
+
+    fn test_proto_len_field(field: u32, payload: Vec<u8>) -> Vec<u8> {
+        let mut out = test_proto_varint(((field as u64) << 3) | 2);
+        out.extend(test_proto_varint(payload.len() as u64));
+        out.extend(payload);
+        out
+    }
+
+    fn test_step_metadata(gen_idx: i64) -> Vec<u8> {
+        // Proto3 omits the scalar field for the first generation (index zero).
+        let gen_ref = if gen_idx == 0 {
+            Vec::new()
+        } else {
+            test_proto_varint_field(3, gen_idx as u64)
+        };
+        test_proto_len_field(20, gen_ref)
+    }
+
+    fn test_gen_metadata_blob(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        duration_ms: u64,
+        model: &str,
+    ) -> Vec<u8> {
+        let mut usage = test_proto_varint_field(1, 1016);
+        usage.extend(test_proto_varint_field(2, input));
+        usage.extend(test_proto_varint_field(3, output));
+        usage.extend(test_proto_varint_field(5, cache_read));
+
+        let seconds = duration_ms / 1000;
+        let nanos = (duration_ms % 1000) * 1_000_000;
+        let mut dur = test_proto_varint_field(1, seconds);
+        dur.extend(test_proto_varint_field(2, nanos));
+
+        let mut metadata = test_proto_len_field(4, usage);
+        metadata.extend(test_proto_len_field(11, dur));
+        metadata.extend(test_proto_len_field(19, model.as_bytes().to_vec()));
+        test_proto_len_field(1, metadata)
+    }
+
+    fn antigravity_message_fixture() -> (tempfile::TempDir, PathBuf, rusqlite::Connection) {
+        let temp = tempdir().expect("tempdir");
+        let session_id = "agy-session-meta";
+        let transcript = temp
+            .path()
+            .join("brain")
+            .join(session_id)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("create brain");
+
+        let conv_dir = temp.path().join("conversations");
+        std::fs::create_dir_all(&conv_dir).expect("create conv_dir");
+        let db_file = conv_dir.join(format!("{session_id}.db"));
+
+        let conn = rusqlite::Connection::open(&db_file).expect("open db");
+        conn.execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);
+             CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+        )
+        .expect("create tables");
+        conn.execute(
+            "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+            [test_step_metadata(0)],
+        )
+        .expect("insert step");
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, data) VALUES (0, ?1)",
+            [test_gen_metadata_blob(
+                1500,
+                42,
+                100,
+                2500,
+                "gemini-3-flash-a",
+            )],
+        )
+        .expect("insert gen_metadata");
+
+        // 真实 transcript 记录不包含 input_tokens / output_tokens / cache_read_tokens / duration_ms
+        let lines = [
+            serde_json::json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>hello</USER_REQUEST>",
+                "created_at": "2026-10-10T10:00:00Z"
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "content": "Hi there!",
+                "created_at": "2026-10-10T10:00:00Z"
+            })
+            .to_string(),
+        ];
+        std::fs::write(&transcript, lines.join("\n")).expect("write transcript");
+
+        (temp, transcript, conn)
+    }
+
+    #[test]
+    fn load_antigravity_messages_populates_meta_from_conversations_db() {
+        let (_temp, transcript, _conn) = antigravity_message_fixture();
+        let messages = load_antigravity_messages(&transcript).expect("load messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "assistant");
+        let meta = messages[1].meta.as_ref().expect("meta should be present");
+        assert_eq!(meta.input_tokens, Some(1500));
+        assert_eq!(meta.output_tokens, Some(42));
+        assert_eq!(meta.cache_read_tokens, Some(100));
+        assert_eq!(meta.duration_ms, Some(2500));
+        assert_eq!(meta.model.as_deref(), Some("gemini-3-flash-a"));
+    }
+
+    #[test]
+    fn antigravity_cached_messages_follow_database_and_wal_updates() {
+        use crate::session_manager::cache::{source_fingerprint, Transcript, TranscriptCache};
+        use crate::session_manager::content::{SourceLocation, ValidatedSource};
+
+        let (temp, transcript, conn) = antigravity_message_fixture();
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .unwrap();
+        let db_path = find_antigravity_db_path(&transcript).unwrap();
+        let source = ValidatedSource {
+            provider_id: "gemini".into(),
+            raw: transcript.to_string_lossy().into_owned(),
+            location: SourceLocation::Path {
+                path: transcript.clone(),
+                root: temp.path().to_path_buf(),
+            },
+        };
+        let cache = TranscriptCache::new(8, usize::MAX);
+        let key = (source.provider_id.clone(), source.raw.clone());
+        let load = || load_messages(&transcript).map(Transcript::new);
+        let before = source_fingerprint(&source).unwrap();
+        let (first, cached) = cache.get_or_load(key.clone(), before, load).unwrap();
+        assert!(!cached);
+        assert_eq!(
+            first.messages[1].meta.as_ref().unwrap().duration_ms,
+            Some(2500)
+        );
+        assert!(cache.get_or_load(key.clone(), before, load).unwrap().1);
+
+        let main_before = std::fs::metadata(&db_path).unwrap();
+        conn.execute(
+            "UPDATE gen_metadata SET data = ?1 WHERE idx = 0",
+            [test_gen_metadata_blob(
+                1500,
+                42,
+                100,
+                5000,
+                "gemini-3-flash-a",
+            )],
+        )
+        .unwrap();
+        let main_after = std::fs::metadata(&db_path).unwrap();
+        assert_eq!(
+            main_before.modified().unwrap(),
+            main_after.modified().unwrap()
+        );
+        assert_eq!(main_before.len(), main_after.len());
+        let wal_changed = source_fingerprint(&source).unwrap();
+        assert_ne!(
+            before, wal_changed,
+            "WAL-only changes must invalidate messages"
+        );
+        let (updated, cached) = cache.get_or_load(key.clone(), wal_changed, load).unwrap();
+        assert!(!cached);
+        assert_eq!(
+            updated.messages[1].meta.as_ref().unwrap().duration_ms,
+            Some(5000)
+        );
+        assert_eq!(
+            updated.messages[1].meta.as_ref().unwrap().output_tokens,
+            Some(42)
+        );
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;")
+            .unwrap();
+        let checkpointed = source_fingerprint(&source).unwrap();
+        conn.execute(
+            "UPDATE gen_metadata SET data = ?1 WHERE idx = 0",
+            [test_gen_metadata_blob(
+                1500,
+                42,
+                100,
+                8000,
+                "gemini-3-flash-a",
+            )],
+        )
+        .unwrap();
+        // Make an in-place DB write observable even on coarse-mtime filesystems.
+        std::fs::File::options()
+            .write(true)
+            .open(&db_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        let db_changed = source_fingerprint(&source).unwrap();
+        assert_ne!(checkpointed, db_changed);
+        let (updated, cached) = cache.get_or_load(key, db_changed, load).unwrap();
+        assert!(!cached);
+        assert_eq!(
+            updated.messages[1].meta.as_ref().unwrap().duration_ms,
+            Some(8000)
+        );
+    }
+
+    #[test]
+    fn antigravity_metadata_read_errors_are_retried_without_caching_partial_messages() {
+        use crate::session_manager::cache::{source_fingerprint, Transcript, TranscriptCache};
+        use crate::session_manager::content::{SourceLocation, ValidatedSource};
+
+        let (temp, transcript, conn) = antigravity_message_fixture();
+        let source = ValidatedSource {
+            provider_id: "gemini".into(),
+            raw: transcript.to_string_lossy().into_owned(),
+            location: SourceLocation::Path {
+                path: transcript.clone(),
+                root: temp.path().to_path_buf(),
+            },
+        };
+        let cache = TranscriptCache::new(8, usize::MAX);
+        let key = (source.provider_id.clone(), source.raw.clone());
+        // A bad row must fail the snapshot instead of flattening away the error.
+        conn.execute("UPDATE steps SET metadata = 'invalid blob'", [])
+            .unwrap();
+        let fingerprint = source_fingerprint(&source).unwrap();
+        let load = || load_messages(&transcript).map(Transcript::new);
+        assert!(cache.get_or_load(key.clone(), fingerprint, load).is_err());
+        assert!(cache.get(&key, fingerprint).is_none());
+        conn.execute("UPDATE steps SET metadata = ?1", [test_step_metadata(0)])
+            .unwrap();
+        // Reuse the same fingerprint: failure itself must leave the cache empty.
+        let (loaded, cached) = cache.get_or_load(key, fingerprint, load).unwrap();
+        assert!(!cached);
+        assert_eq!(
+            loaded.messages[1].meta.as_ref().unwrap().duration_ms,
+            Some(2500)
+        );
+    }
+
+    #[test]
+    fn antigravity_database_lookup_stays_with_the_transcript_root() {
+        let (temp, transcript, conn) = antigravity_message_fixture();
+        let own_db = find_antigravity_db_path(&transcript).unwrap();
+        drop(conn);
+        std::fs::remove_file(&own_db).unwrap();
+        // The old ancestor search would accidentally use this unrelated DB.
+        // Keep all fixtures inside the temp root by making it the ancestor root.
+        let nested_transcript = temp
+            .path()
+            .join("nested/brain/agy-session-meta/.system_generated/logs/transcript.jsonl");
+        std::fs::create_dir_all(nested_transcript.parent().unwrap()).unwrap();
+        std::fs::write(&nested_transcript, "{}\n").unwrap();
+        std::fs::write(&own_db, b"unrelated DB").unwrap();
+        assert_eq!(find_antigravity_db_path(&nested_transcript), None);
+        assert_eq!(find_antigravity_db_path(&transcript), Some(own_db));
+        assert_eq!(
+            find_antigravity_db_path(&temp.path().join("transcript.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn load_antigravity_messages_does_not_use_next_record_gap_for_duration() {
+        let temp = tempdir().expect("tempdir");
+        let transcript = temp.path().join("transcript.jsonl");
+
+        // 助手回复后，用户等待十分钟（600,000ms）再提问：
+        // 绝不应将此 10 分钟等待算作助手的生成耗时
+        let lines = [
+            serde_json::json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>hello</USER_REQUEST>",
+                "created_at": "2026-10-10T10:00:00Z"
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "content": "Hi there!",
+                "created_at": "2026-10-10T10:00:00Z"
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 2,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>next question after 10m</USER_REQUEST>",
+                "created_at": "2026-10-10T10:10:00Z"
+            })
+            .to_string(),
+        ];
+        std::fs::write(&transcript, lines.join("\n")).expect("write transcript");
+
+        let messages = load_antigravity_messages(&transcript).expect("load messages");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, "assistant");
+        let duration = messages[1].meta.as_ref().and_then(|m| m.duration_ms);
+        assert_eq!(
+            duration, None,
+            "无法确定真实生成耗时时应保持缺失，绝不使用下一记录间隔"
+        );
     }
 
     #[test]

@@ -497,15 +497,16 @@ impl<'a> ProtoParser<'a> {
     }
 }
 
-#[derive(Debug, Default)]
-struct AntigravityTokenData {
+#[derive(Debug, Default, Clone)]
+pub(crate) struct AntigravityTokenData {
     // Raw `gen_metadata` field f2: fresh input only. The importer combines it
     // with `cached_tokens` before persistence to match upstream Gemini rows.
-    input_tokens: u32,
-    output_tokens: u32,
+    pub(crate) input_tokens: u32,
+    pub(crate) output_tokens: u32,
     // Raw `gen_metadata` field f5: cache-read input.
-    cached_tokens: u32,
-    model: String,
+    pub(crate) cached_tokens: u32,
+    pub(crate) model: String,
+    pub(crate) duration_ms: Option<i64>,
 }
 
 impl AntigravityTokenData {
@@ -765,6 +766,19 @@ fn read_step_states(conn: &rusqlite::Connection) -> Result<AntigravityStepStates
     })
 }
 
+pub(crate) fn parse_step_gen_idx(data: &[u8]) -> Option<i64> {
+    let mut parser = ProtoParser::new(data);
+    while let Some((field, value)) = parser.next_field() {
+        if field == 20 {
+            if let ProtoValue::LengthDelimited(nested) = value {
+                let mut f20 = ProtoParser::new(&nested);
+                return Some(f20.get_varint(3).unwrap_or(0) as i64);
+            }
+        }
+    }
+    None
+}
+
 fn parse_step_metadata(data: &[u8]) -> Option<(i64, i64)> {
     let mut parser = ProtoParser::new(data);
     let mut timestamp: Option<i64> = None;
@@ -778,7 +792,7 @@ fn parse_step_metadata(data: &[u8]) -> Option<(i64, i64)> {
             }
             (20, ProtoValue::LengthDelimited(nested)) => {
                 let mut f20 = ProtoParser::new(&nested);
-                gen_idx = f20.get_varint(3).map(|value| value as i64);
+                gen_idx = Some(f20.get_varint(3).unwrap_or(0) as i64);
             }
             _ => {}
         }
@@ -790,18 +804,39 @@ fn parse_step_metadata(data: &[u8]) -> Option<(i64, i64)> {
     }
 }
 
-fn parse_gen_metadata_blob(data: &[u8]) -> Option<AntigravityTokenData> {
+pub(crate) fn parse_gen_metadata_blob(data: &[u8]) -> Option<AntigravityTokenData> {
     let mut parser = ProtoParser::new(data);
     let f1_blob = parser.get_nested(1)?;
     let mut f1 = ProtoParser::new(&f1_blob);
     let mut step_tokens = AntigravityTokenData::default();
     let mut cumulative_tokens = AntigravityTokenData::default();
     let mut model = String::new();
+    let mut duration_ms: Option<i64> = None;
 
     while let Some((field, value)) = f1.next_field() {
         match (field, value) {
             (4, ProtoValue::LengthDelimited(nested)) => {
                 extract_token_fields(&nested, &mut step_tokens);
+            }
+            (11, ProtoValue::LengthDelimited(nested)) => {
+                let mut dur_parser = ProtoParser::new(&nested);
+                let mut seconds: i64 = 0;
+                let mut nanos: i64 = 0;
+                while let Some((field, value)) = dur_parser.next_field() {
+                    if let ProtoValue::Varint(val) = value {
+                        match field {
+                            1 => seconds = val as i64,
+                            2 => nanos = val as i64,
+                            _ => {}
+                        }
+                    }
+                }
+                let ms = seconds
+                    .saturating_mul(1000)
+                    .saturating_add(nanos / 1_000_000);
+                if (100..=3_600_000).contains(&ms) {
+                    duration_ms = Some(ms);
+                }
             }
             (17, ProtoValue::LengthDelimited(nested)) => {
                 let mut f17 = ProtoParser::new(&nested);
@@ -849,6 +884,7 @@ fn parse_gen_metadata_blob(data: &[u8]) -> Option<AntigravityTokenData> {
         model = "unknown".to_string();
     }
     token_data.model = model;
+    token_data.duration_ms = duration_ms;
     Some(token_data)
 }
 
@@ -988,6 +1024,10 @@ fn insert_antigravity_session_entry(
         ),
     };
 
+    // A running generation may finish its timing after its tokens are present.
+    // Persist both in this same UPSERT, including timing-only changes. There is
+    // no separate latency read/update or historical backfill pass; the existing
+    // running-step checkpoint controls which source generations are replayed.
     let upserted = tx.execute(
         "INSERT INTO proxy_request_logs (
             request_id, provider_id, app_type, model, request_model,
@@ -1008,13 +1048,15 @@ fn insert_antigravity_session_entry(
             cache_read_cost_usd = excluded.cache_read_cost_usd,
             cache_creation_cost_usd = excluded.cache_creation_cost_usd,
             total_cost_usd = excluded.total_cost_usd,
+            latency_ms = CASE WHEN excluded.latency_ms > 0 THEN excluded.latency_ms ELSE proxy_request_logs.latency_ms END,
             created_at = excluded.created_at
         WHERE input_tokens != excluded.input_tokens
            OR output_tokens != excluded.output_tokens
            OR cache_read_tokens != excluded.cache_read_tokens
            OR model != excluded.model
            OR pricing_model IS NOT excluded.pricing_model
-           OR created_at != excluded.created_at",
+           OR created_at != excluded.created_at
+           OR (excluded.latency_ms > 0 AND excluded.latency_ms != proxy_request_logs.latency_ms)",
         rusqlite::params![
             request_id,
             "_gemini_antigravity_session",
@@ -1030,7 +1072,7 @@ fn insert_antigravity_session_entry(
             cache_read_cost,
             cache_creation_cost,
             total_cost,
-            0i64,
+            token_data.duration_ms.unwrap_or(0),
             Option::<i64>::None,
             200i64,
             Option::<String>::None,
@@ -1278,6 +1320,73 @@ mod tests {
         assert_eq!(usage.output_tokens, 14_479);
         assert_eq!(usage.cached_tokens, 28_519);
         assert_eq!(usage.model, "gemini-3-flash-a");
+        assert_eq!(usage.duration_ms, None);
+    }
+
+    #[test]
+    fn test_parse_antigravity_usage_extracts_duration_from_field_11() {
+        let mut usage = proto_varint_field(1, 1016);
+        usage.extend(proto_varint_field(2, 100));
+        usage.extend(proto_varint_field(3, 200));
+
+        let mut dur = proto_varint_field(1, 5); // 5s
+        dur.extend(proto_varint_field(2, 244_000_000)); // 244ms
+
+        let mut metadata = proto_len_field(4, usage.clone());
+        metadata.extend(proto_len_field(11, dur));
+        metadata.extend(proto_len_field(19, b"gemini-3-flash-a".to_vec()));
+        let data = proto_len_field(1, metadata);
+
+        let parsed = parse_gen_metadata_blob(&data).expect("Agy usage should parse");
+        assert_eq!(parsed.duration_ms, Some(5244));
+
+        // 仅包含 nanos（seconds = 0 省略），应正确解析为 500ms
+        let dur_nanos_only = proto_varint_field(2, 500_000_000);
+        let mut meta_nanos = proto_len_field(4, usage.clone());
+        meta_nanos.extend(proto_len_field(11, dur_nanos_only));
+        meta_nanos.extend(proto_len_field(19, b"gemini-3-flash-a".to_vec()));
+        let data_nanos = proto_len_field(1, meta_nanos);
+        let parsed_nanos = parse_gen_metadata_blob(&data_nanos).expect("Agy usage should parse");
+        assert_eq!(parsed_nanos.duration_ms, Some(500));
+
+        // 字段顺序为 nanos 在前、seconds 在后，应正确累加为 5244ms
+        let mut dur_rev = proto_varint_field(2, 244_000_000);
+        dur_rev.extend(proto_varint_field(1, 5));
+        let mut meta_rev = proto_len_field(4, usage);
+        meta_rev.extend(proto_len_field(11, dur_rev));
+        meta_rev.extend(proto_len_field(19, b"gemini-3-flash-a".to_vec()));
+        let data_rev = proto_len_field(1, meta_rev);
+        let parsed_rev = parse_gen_metadata_blob(&data_rev).expect("Agy usage should parse");
+        assert_eq!(parsed_rev.duration_ms, Some(5244));
+    }
+
+    #[test]
+    fn test_parse_antigravity_usage_rejects_out_of_range_duration() {
+        let mut usage = proto_varint_field(1, 1016);
+        usage.extend(proto_varint_field(2, 100));
+        usage.extend(proto_varint_field(3, 200));
+
+        // 50ms is too short (< 100ms)
+        let dur_short = proto_varint_field(2, 50_000_000);
+
+        let mut metadata_short = proto_len_field(4, usage.clone());
+        metadata_short.extend(proto_len_field(11, dur_short));
+        metadata_short.extend(proto_len_field(19, b"gemini-3-flash-a".to_vec()));
+        let data_short = proto_len_field(1, metadata_short);
+
+        let parsed_short = parse_gen_metadata_blob(&data_short).expect("Agy usage should parse");
+        assert_eq!(parsed_short.duration_ms, None);
+
+        // 2 hours is too long (> 3600s)
+        let dur_long = proto_varint_field(1, 7200);
+
+        let mut metadata_long = proto_len_field(4, usage);
+        metadata_long.extend(proto_len_field(11, dur_long));
+        metadata_long.extend(proto_len_field(19, b"gemini-3-flash-a".to_vec()));
+        let data_long = proto_len_field(1, metadata_long);
+
+        let parsed_long = parse_gen_metadata_blob(&data_long).expect("Agy usage should parse");
+        assert_eq!(parsed_long.duration_ms, None);
     }
 
     fn step_metadata(gen_idx: i64, timestamp: i64) -> Vec<u8> {
@@ -1366,6 +1475,7 @@ mod tests {
             output_tokens: 2,
             cached_tokens: 1,
             model: "gemini-3-pro-b".to_string(),
+            duration_ms: None,
         };
         assert!(insert_antigravity_session_entry(
             &db,
@@ -1380,6 +1490,7 @@ mod tests {
             output_tokens: 7,
             cached_tokens: 2,
             model: "gemini-3-flash-a-thinking".to_string(),
+            duration_ms: Some(1500),
         };
         assert!(insert_antigravity_session_entry(
             &db,
@@ -1390,8 +1501,8 @@ mod tests {
         )?);
 
         let conn = lock_conn!(db.conn);
-        let row: (i64, i64, i64, String, String, i64) = conn.query_row(
-            "SELECT input_tokens, output_tokens, cache_read_tokens, model, pricing_model, created_at
+        let row: (i64, i64, i64, String, String, i64, i64) = conn.query_row(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, model, pricing_model, created_at, latency_ms
              FROM proxy_request_logs WHERE request_id = ?1",
             rusqlite::params![request_id],
             |row| {
@@ -1402,6 +1513,7 @@ mod tests {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )?;
@@ -1413,7 +1525,8 @@ mod tests {
                 2,
                 "gemini-3-flash-a-thinking".to_string(),
                 "gemini-3.5-flash".to_string(),
-                2000
+                2000,
+                1500
             )
         );
 
@@ -1569,6 +1682,7 @@ mod tests {
             output_tokens: 50,
             cached_tokens: 20,
             model: "gemini-3.5-flash".to_string(),
+            duration_ms: None,
         };
 
         // 1. 首次导入：写入明细与去重账本
@@ -1641,6 +1755,7 @@ mod tests {
             output_tokens: 2,
             cached_tokens: 0,
             model: "gemini-3.5-flash".to_string(),
+            duration_ms: None,
         };
         assert!(insert_antigravity_session_entry(
             &db,
@@ -1656,6 +1771,7 @@ mod tests {
             output_tokens: 40,
             cached_tokens: 20,
             model: "gemini-3.5-flash".to_string(),
+            duration_ms: None,
         };
         let updated = insert_antigravity_session_entry(
             &db,
@@ -1693,6 +1809,65 @@ mod tests {
     }
 
     #[test]
+    fn test_antigravity_session_entry_updates_existing_positive_latency() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let request_id = "latency-update-test";
+        let initial_tokens = AntigravityTokenData {
+            input_tokens: 100,
+            output_tokens: 400,
+            cached_tokens: 0,
+            model: "gemini-3.5-flash".to_string(),
+            duration_ms: Some(5000),
+        };
+        assert!(insert_antigravity_session_entry(
+            &db,
+            request_id,
+            &initial_tokens,
+            Some("session-lat"),
+            1_000,
+        )?);
+
+        {
+            let conn = lock_conn!(db.conn);
+            let lat: i64 = conn.query_row(
+                "SELECT latency_ms FROM proxy_request_logs WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(lat, 5000);
+        }
+
+        // 仅耗时修正：从 5000ms 修正为 8000ms，其他字段保持不变
+        let corrected_tokens = AntigravityTokenData {
+            input_tokens: 100,
+            output_tokens: 400,
+            cached_tokens: 0,
+            model: "gemini-3.5-flash".to_string(),
+            duration_ms: Some(8000),
+        };
+        let updated = insert_antigravity_session_entry(
+            &db,
+            request_id,
+            &corrected_tokens,
+            Some("session-lat"),
+            1_000,
+        )?;
+        assert!(updated, "已有正数耗时发生修正时应成功更新");
+
+        {
+            let conn = lock_conn!(db.conn);
+            let lat: i64 = conn.query_row(
+                "SELECT latency_ms FROM proxy_request_logs WHERE request_id = ?1",
+                [request_id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(lat, 8000, "数据库应更新为修正后的 8000ms");
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_antigravity_proxy_first_records_ledger_and_skips_detail() -> Result<(), AppError> {
         let db = Database::memory()?;
 
@@ -1715,6 +1890,7 @@ mod tests {
             output_tokens: 50,
             cached_tokens: 20,
             model: "gemini-3.5-flash".to_string(),
+            duration_ms: None,
         };
         let imported = insert_antigravity_session_entry(
             &db,
@@ -1886,6 +2062,7 @@ mod tests {
                 output_tokens: 50,
                 cached_tokens: 20,
                 model: raw_model.to_string(),
+                duration_ms: None,
             };
             assert!(insert_antigravity_session_entry(
                 &db,
@@ -1951,6 +2128,66 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?)
+    }
+
+    #[test]
+    fn antigravity_sync_updates_timing_without_token_changes() -> Result<(), AppError> {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("timing.db");
+        let source = antigravity_sync_fixture(&path, 2)?;
+        let blob = |duration_ms: Option<u64>| {
+            let data = antigravity_gen_metadata(80, 400, 20, 400, 0);
+            let mut metadata = ProtoParser::new(&data).get_nested(1).unwrap();
+            if let Some(ms) = duration_ms {
+                let mut duration = proto_varint_field(1, ms / 1000);
+                duration.extend(proto_varint_field(2, (ms % 1000) * 1_000_000));
+                metadata.extend(proto_len_field(11, duration));
+            }
+            proto_len_field(1, metadata)
+        };
+        source.execute("UPDATE gen_metadata SET data = ?1", [blob(None)])?;
+        let db = Database::memory()?;
+        let key = path.to_string_lossy();
+        assert_eq!(sync_single_antigravity_db(&db, &path)?, (1, 0));
+        assert_eq!(get_sync_state(&db, &key)?, (0, 0));
+        let initial_cost: String = {
+            let conn = lock_conn!(db.conn);
+            conn.query_row("SELECT total_cost_usd FROM proxy_request_logs", [], |r| {
+                r.get(0)
+            })?
+        };
+
+        // Tokens stay identical: missing timing and then corrected positive
+        // timing must each update the existing row through the real sync path.
+        for duration in [5000, 8000] {
+            source.execute("UPDATE gen_metadata SET data = ?1", [blob(Some(duration))])?;
+            assert_eq!(sync_single_antigravity_db(&db, &path)?, (1, 0));
+            assert_eq!(sync_single_antigravity_db(&db, &path)?, (0, 1));
+            assert_eq!(get_sync_state(&db, &key)?, (0, 0));
+            let stats = db.get_provider_stats(None, None, None, None, None)?;
+            assert_eq!(stats.len(), 1);
+            assert_eq!(stats[0].request_count, 1);
+            assert_eq!(stats[0].est_speed_output_tokens, 400);
+            assert_eq!(stats[0].est_speed_duration_ms, duration);
+            assert_eq!(stats[0].speed_output_tokens, 0);
+            let conn = lock_conn!(db.conn);
+            let row: (i64, i64, String, i64) = conn.query_row(
+                "SELECT input_tokens, output_tokens, total_cost_usd, latency_ms FROM proxy_request_logs",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            assert_eq!(row, (100, 400, initial_cost.clone(), duration as i64));
+            let ledger_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM session_usage_dedup", [], |r| r.get(0))?;
+            assert_eq!(ledger_count, 1);
+        }
+
+        source.execute("UPDATE steps SET status = 3", [])?;
+        assert_eq!(sync_single_antigravity_db(&db, &path)?, (0, 1));
+        let (modified, offset) = get_sync_state(&db, &key)?;
+        assert!(modified > 0);
+        assert_eq!(offset, 1);
+        assert_eq!(sync_single_antigravity_db(&db, &path)?, (0, 0));
+        Ok(())
     }
 
     #[test]
