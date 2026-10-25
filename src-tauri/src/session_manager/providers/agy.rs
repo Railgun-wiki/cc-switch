@@ -184,7 +184,7 @@ fn scan_root(root: &Path, gemini_dir: Option<&Path>) -> Vec<SessionMeta> {
             let mut meta = if let Some(meta) = summaries.remove(id) {
                 meta
             } else {
-                let Some((text, created_at)) = native::preview(&path) else {
+                let Some((text, created_at, last_active_at)) = native::preview(&path) else {
                     continue;
                 };
                 SessionMeta {
@@ -194,7 +194,7 @@ fn scan_root(root: &Path, gemini_dir: Option<&Path>) -> Vec<SessionMeta> {
                     summary: (!text.is_empty()).then(|| truncate_summary(&text, 160)),
                     project_dir: None,
                     created_at,
-                    last_active_at: created_at,
+                    last_active_at,
                     source_path: None,
                     resume_command: Some(crate::agy_config::resume_command(gemini_dir, id)),
                 }
