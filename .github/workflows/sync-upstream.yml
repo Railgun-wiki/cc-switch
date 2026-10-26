@@ -1,0 +1,33 @@
+name: Sync upstream and open PR branches
+
+on:
+  schedule:
+    - cron: "23 20 * * *" # 每天 04:23，Asia/Singapore (UTC+8)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Railgun-wiki/cc-switch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          # Optional PAT/App token: required to push upstream workflow changes,
+          # and to trigger CI from the resulting pushes.
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream into main and this fork's open PR branches
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          UPSTREAM_REPOSITORY: farion1231/cc-switch
+          SYNC_AUTHOR: Railgun-wiki
+        run: bash scripts/sync-upstream.sh
