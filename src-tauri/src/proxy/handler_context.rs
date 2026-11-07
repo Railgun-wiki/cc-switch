@@ -295,6 +295,7 @@ impl RequestContext {
             self.copilot_optimizer_config.clone(),
             max_retries,
         )
+        .copilot_fusion_sessions(state.copilot_fusion_sessions.clone())
         .stack_request(self.is_stack)
     }
 

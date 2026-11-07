@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -583,6 +584,8 @@ pub struct CopilotAuthManager {
     pending_migration: Arc<RwLock<Option<String>>>,
     /// 旧认证数据迁移失败时的状态消息
     migration_error: Arc<RwLock<Option<String>>>,
+    /// 凭证代次（账号添加/删除/切换默认时自增，使失效的 Fusion 会话感知）
+    credential_generation: Arc<AtomicU64>,
 }
 
 impl CopilotAuthManager {
@@ -601,6 +604,7 @@ impl CopilotAuthManager {
             storage_path,
             pending_migration: Arc::new(RwLock::new(None)),
             migration_error: Arc::new(RwLock::new(None)),
+            credential_generation: Arc::new(AtomicU64::new(1)),
         };
 
         // 尝试从磁盘加载（同步，不发起网络请求）
@@ -609,6 +613,16 @@ impl CopilotAuthManager {
         }
 
         manager
+    }
+
+    /// 获取凭证代次
+    pub fn get_credential_generation(&self) -> u64 {
+        self.credential_generation.load(Ordering::Relaxed)
+    }
+
+    /// 递增凭证代次（在账号变更、登出或关键凭证重置时调用）
+    pub fn bump_credential_generation(&self) {
+        self.credential_generation.fetch_add(1, Ordering::SeqCst);
     }
 
     // ==================== 多账号管理方法 ====================
@@ -670,6 +684,7 @@ impl CopilotAuthManager {
 
         // 持久化
         self.save_to_disk().await?;
+        self.bump_credential_generation();
 
         Ok(())
     }
@@ -716,6 +731,7 @@ impl CopilotAuthManager {
 
         // 持久化
         self.save_to_disk().await?;
+        self.bump_credential_generation();
 
         log::info!("[CopilotAuth] 添加账号成功: {}", user.login);
 
@@ -737,6 +753,7 @@ impl CopilotAuthManager {
         }
 
         self.save_to_disk().await?;
+        self.bump_credential_generation();
         Ok(())
     }
 
@@ -1372,6 +1389,7 @@ impl CopilotAuthManager {
         if self.storage_path.exists() {
             std::fs::remove_file(&self.storage_path)?;
         }
+        self.bump_credential_generation();
 
         Ok(())
     }
@@ -2573,6 +2591,39 @@ mod tests {
 
         let api_endpoints = manager.api_endpoints.read().await;
         assert!(api_endpoints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_credential_generation_bumps_on_logout_and_removal() {
+        let temp_dir = tempdir().unwrap();
+        let manager = CopilotAuthManager::new(temp_dir.path().to_path_buf());
+        let initial_gen = manager.get_credential_generation();
+
+        // Adding account data
+        {
+            let mut accounts = manager.accounts.write().await;
+            accounts.insert(
+                "acc_1".to_string(),
+                GitHubAccountData {
+                    github_token: "gho_test".to_string(),
+                    user: GitHubUser {
+                        login: "alice".to_string(),
+                        id: 1,
+                        avatar_url: None,
+                    },
+                    authenticated_at: 100,
+                    github_domain: "github.com".to_string(),
+                },
+            );
+        }
+
+        manager.remove_account("acc_1").await.unwrap();
+        let gen_after_remove = manager.get_credential_generation();
+        assert!(gen_after_remove > initial_gen);
+
+        manager.clear_auth().await.unwrap();
+        let gen_after_clear = manager.get_credential_generation();
+        assert!(gen_after_clear > gen_after_remove);
     }
 
     #[tokio::test]
