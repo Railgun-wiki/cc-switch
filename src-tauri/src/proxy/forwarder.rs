@@ -967,7 +967,10 @@ impl RequestForwarder {
                                 let copilot_auth = copilot_state.0.read().await;
                                 if let Some(attempt) = &attempted_copilot_auth {
                                     copilot_auth
-                                        .invalidate_token_if_matches(&attempt.account_id, &attempt.token)
+                                        .invalidate_token_if_matches(
+                                            &attempt.account_id,
+                                            &attempt.token,
+                                        )
                                         .await;
                                 } else {
                                     let acct = provider
@@ -1561,9 +1564,10 @@ impl RequestForwarder {
                 }
             }
 
-            if let (Some(account_id), Some(token)) =
-                (resolved_copilot_account_id.as_ref(), copilot_token_opt.as_ref())
-            {
+            if let (Some(account_id), Some(token)) = (
+                resolved_copilot_account_id.as_ref(),
+                copilot_token_opt.as_ref(),
+            ) {
                 *attempted_copilot_auth = Some(CopilotAuthAttempt {
                     account_id: account_id.clone(),
                     token: token.clone(),
@@ -9428,118 +9432,207 @@ mod tests {
             }
         }
 
-        #[tokio::test]
-        async fn copilot_streaming_resolution_uses_streaming_first_byte_timeout() {
+        struct FusionTimeoutAdapter;
+
+        impl ProviderAdapter for FusionTimeoutAdapter {
+            fn name(&self) -> &'static str {
+                "Claude"
+            }
+
+            fn extract_base_url(&self, provider: &Provider) -> Result<String, ProxyError> {
+                Ok(provider.settings_config["env"]["ANTHROPIC_BASE_URL"]
+                    .as_str()
+                    .expect("mock upstream URL")
+                    .to_string())
+            }
+
+            fn extract_auth(&self, _provider: &Provider) -> Option<AuthInfo> {
+                Some(AuthInfo::new(
+                    "fusion-test-bearer".to_string(),
+                    AuthStrategy::GitHubCopilot,
+                ))
+            }
+
+            fn build_url(&self, base_url: &str, endpoint: &str) -> String {
+                format!("{base_url}{endpoint}")
+            }
+
+            fn get_auth_headers(
+                &self,
+                auth: &AuthInfo,
+            ) -> Result<Vec<(http::HeaderName, http::HeaderValue)>, ProxyError> {
+                crate::proxy::providers::copilot_auth::build_copilot_request_headers(&auth.api_key)
+            }
+        }
+
+        #[derive(Default)]
+        struct FusionTimeoutCalls {
+            auto: usize,
+            responses: usize,
+        }
+
+        struct FusionTimeoutUpstream {
+            base_url: String,
+            calls: Arc<Mutex<FusionTimeoutCalls>>,
+            server: tokio::task::JoinHandle<()>,
+        }
+
+        impl Drop for FusionTimeoutUpstream {
+            fn drop(&mut self) {
+                self.server.abort();
+            }
+        }
+
+        async fn fusion_timeout_upstream(
+            auto_delay: Duration,
+            response_delay: Duration,
+        ) -> FusionTimeoutUpstream {
+            let calls = Arc::new(Mutex::new(FusionTimeoutCalls::default()));
+            let app = axum::Router::new()
+                .route(
+                    "/auto",
+                    axum::routing::post({
+                        let calls = calls.clone();
+                        move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                            let calls = calls.clone();
+                            async move {
+                                assert_eq!(headers["authorization"], "Bearer fusion-test-bearer");
+                                assert_eq!(body["fusion"], true);
+                                calls.lock().await.auto += 1;
+                                tokio::time::sleep(auto_delay).await;
+                                axum::Json(json!({
+                                    "selected_model": { "id": "gpt-4.1" },
+                                    "session_token": "fusion-test-session"
+                                }))
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/responses",
+                    axum::routing::post({
+                        let calls = calls.clone();
+                        move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                            let calls = calls.clone();
+                            async move {
+                                assert_eq!(headers["authorization"], "Bearer fusion-test-bearer");
+                                assert_eq!(headers["copilot-session-token"], "fusion-test-session");
+                                assert_eq!(body["model"], "gpt-4.1");
+                                calls.lock().await.responses += 1;
+                                tokio::time::sleep(response_delay).await;
+                                axum::Json(json!({
+                                    "id": "mock-response",
+                                    "object": "response",
+                                    "status": "completed",
+                                    "model": "gpt-4.1",
+                                    "output": [{
+                                        "id": "mock-message",
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "status": "completed",
+                                        "content": [{
+                                            "type": "output_text",
+                                            "text": "Hello",
+                                            "annotations": []
+                                        }]
+                                    }]
+                                }))
+                            }
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind Fusion mock upstream");
+            let addr = listener.local_addr().expect("Fusion mock upstream address");
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve Fusion mock upstream");
+            });
+            FusionTimeoutUpstream {
+                base_url: format!("http://{addr}"),
+                calls,
+                server,
+            }
+        }
+
+        async fn forward_to_fusion_timeout_upstream(
+            upstream: &FusionTimeoutUpstream,
+            non_streaming_timeout: Duration,
+            first_byte_timeout: Duration,
+            stream: bool,
+        ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
             let mut provider = test_provider_with_type(Some("github_copilot"));
             provider.settings_config = json!({
-                "env": {
-                    "ANTHROPIC_BASE_URL": "https://api.individual.githubcopilot.com"
-                }
+                "env": { "ANTHROPIC_BASE_URL": upstream.base_url }
             });
-            provider.meta = Some(crate::provider::ProviderMeta {
-                provider_type: Some("github_copilot".to_string()),
-                copilot_model_selection: Some("fusion".to_string()),
-                ..Default::default()
-            });
-
-            // non_streaming_timeout 为 60s，但流式首包超时只有 1ms
-            let forwarder = test_forwarder(Duration::from_secs(60), Duration::from_millis(1));
-            let body = serde_json::json!({
+            provider.meta.as_mut().unwrap().copilot_model_selection = Some("fusion".to_string());
+            let forwarder = test_forwarder(non_streaming_timeout, first_byte_timeout);
+            let body = json!({
                 "model": "copilot-fusion-auto",
-                "stream": true,
+                "stream": stream,
                 "messages": [{"role": "user", "content": "hello"}]
             });
-            let headers = HeaderMap::new();
-            let extensions = http::Extensions::new();
-            let adapter =
-                crate::proxy::providers::get_adapter(&crate::app_config::AppType::Claude).unwrap();
-            let mut codex_format = None;
-            let mut copilot_auth_attempt = None;
-
-            // 给点时间让 1ms 预算用尽
-            tokio::time::sleep(Duration::from_millis(5)).await;
-
-            let result = forwarder
+            forwarder
                 .forward(
-                    &crate::app_config::AppType::Claude,
+                    &AppType::Claude,
                     &http::Method::POST,
                     &provider,
                     "/v1/messages",
                     &body,
-                    &headers,
-                    &extensions,
-                    adapter.as_ref(),
-                    &mut codex_format,
-                    &mut copilot_auth_attempt,
+                    &HeaderMap::new(),
+                    &Extensions::new(),
+                    &FusionTimeoutAdapter,
+                    &mut None,
+                    &mut None,
                 )
-                .await;
+                .await
+        }
 
-            match result {
-                Err(ProxyError::Timeout(msg)) => {
-                    assert!(
-                        msg.contains("超时") || msg.contains("timed out"),
-                        "expected timeout message, got: {msg}"
-                    );
-                }
-                Err(other) => panic!("expected ProxyError::Timeout, got error: {other}"),
-                Ok(_) => panic!("expected ProxyError::Timeout, got Ok"),
-            }
+        #[tokio::test]
+        async fn copilot_streaming_resolution_uses_streaming_first_byte_timeout() {
+            // The mock decision would fit the non-streaming budget, but must exceed
+            // the streaming first-byte budget. Execution must never start.
+            let upstream = fusion_timeout_upstream(Duration::from_secs(2), Duration::ZERO).await;
+            let result = forward_to_fusion_timeout_upstream(
+                &upstream,
+                Duration::from_secs(5),
+                Duration::from_millis(500),
+                true,
+            )
+            .await;
+
+            assert!(
+                matches!(&result, Err(ProxyError::Timeout(_))),
+                "expected the streaming resolution budget to expire"
+            );
+            let calls = upstream.calls.lock().await;
+            assert_eq!(calls.auto, 1, "the decision request must reach the mock");
+            assert_eq!(calls.responses, 0, "execution must not start after timeout");
         }
 
         #[tokio::test]
         async fn copilot_non_streaming_shared_timeout_budget_expires() {
-            let mut provider = test_provider_with_type(Some("github_copilot"));
-            provider.settings_config = json!({
-                "env": {
-                    "ANTHROPIC_BASE_URL": "https://api.individual.githubcopilot.com"
-                }
-            });
-            provider.meta = Some(crate::provider::ProviderMeta {
-                provider_type: Some("github_copilot".to_string()),
-                copilot_model_selection: Some("fusion".to_string()),
-                ..Default::default()
-            });
+            // Each phase fits a fresh two-second budget, but together they do not.
+            // Resetting the execution budget would incorrectly return success.
+            let phase_delay = Duration::from_millis(1250);
+            let upstream = fusion_timeout_upstream(phase_delay, phase_delay).await;
+            let result = forward_to_fusion_timeout_upstream(
+                &upstream,
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+                false,
+            )
+            .await;
 
-            // 非流式超时仅 1ms
-            let forwarder = test_forwarder(Duration::from_millis(1), Duration::from_secs(60));
-            let body = serde_json::json!({
-                "model": "copilot-fusion-auto",
-                "messages": [{"role": "user", "content": "hello"}]
-            });
-            let headers = HeaderMap::new();
-            let extensions = http::Extensions::new();
-            let adapter =
-                crate::proxy::providers::get_adapter(&crate::app_config::AppType::Claude).unwrap();
-            let mut codex_format = None;
-            let mut copilot_auth_attempt = None;
-
-            tokio::time::sleep(Duration::from_millis(5)).await;
-
-            let result = forwarder
-                .forward(
-                    &crate::app_config::AppType::Claude,
-                    &http::Method::POST,
-                    &provider,
-                    "/v1/messages",
-                    &body,
-                    &headers,
-                    &extensions,
-                    adapter.as_ref(),
-                    &mut codex_format,
-                    &mut copilot_auth_attempt,
-                )
-                .await;
-
-            match result {
-                Err(ProxyError::Timeout(msg)) => {
-                    assert!(
-                        msg.contains("超时") || msg.contains("timed out"),
-                        "expected timeout message, got: {msg}"
-                    );
-                }
-                Err(other) => panic!("expected ProxyError::Timeout, got error: {other}"),
-                Ok(_) => panic!("expected ProxyError::Timeout, got Ok"),
-            }
+            assert!(
+                matches!(&result, Err(ProxyError::Timeout(_))),
+                "decision and execution must share one deadline"
+            );
+            let calls = upstream.calls.lock().await;
+            assert_eq!(calls.auto, 1, "the decision request must complete first");
+            assert_eq!(calls.responses, 1, "the execution phase must be exercised");
         }
     }
 }
