@@ -337,6 +337,8 @@ mod tests {
         assert!(!ProviderType::GeminiCli.needs_transform());
         assert!(!ProviderType::OpenRouter.needs_transform());
         assert!(ProviderType::GitHubCopilot.needs_transform());
+        assert!(ProviderType::CodexOAuth.needs_transform());
+        assert!(ProviderType::XaiOAuth.needs_transform());
     }
 
     #[test]
@@ -369,6 +371,11 @@ mod tests {
             ProviderType::GitHubCopilot.default_endpoint(),
             "https://api.githubcopilot.com"
         );
+        assert_eq!(
+            ProviderType::CodexOAuth.default_endpoint(),
+            CHATGPT_CODEX_BASE_URL
+        );
+        assert_eq!(ProviderType::XaiOAuth.default_endpoint(), XAI_API_BASE_URL);
     }
 
     #[test]
@@ -433,6 +440,7 @@ mod tests {
         assert_eq!(ProviderType::GeminiCli.as_str(), "gemini_cli");
         assert_eq!(ProviderType::OpenRouter.as_str(), "openrouter");
         assert_eq!(ProviderType::GitHubCopilot.as_str(), "github_copilot");
+        assert_eq!(ProviderType::CodexOAuth.as_str(), "codex_oauth");
         assert_eq!(ProviderType::XaiOAuth.as_str(), "xai_oauth");
     }
 
