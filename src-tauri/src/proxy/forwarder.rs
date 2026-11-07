@@ -392,8 +392,7 @@ pub struct RequestForwarder {
     /// 最近一次 `forward()` 定下的出站模型名，失败时随 [`ForwardError`] 交给日志。
     /// 每次 `forward()` 开头清空，映射失败等没走到出站的尝试留 None（日志回落到请求名）。
     last_outbound_model: std::sync::Mutex<Option<String>>,
-    pub(crate) copilot_fusion_sessions:
-        Option<Arc<super::copilot_fusion_session::FusionSessionManager>>,
+    pub(crate) copilot_fusion_sessions: Arc<super::copilot_fusion_session::FusionSessionManager>,
 }
 
 impl RequestForwarder {
@@ -529,7 +528,9 @@ impl RequestForwarder {
             stack_request: false,
             failover_chain: false,
             last_outbound_model: std::sync::Mutex::new(None),
-            copilot_fusion_sessions: None,
+            copilot_fusion_sessions: Arc::new(
+                crate::proxy::copilot_fusion_session::FusionSessionManager::default(),
+            ),
         }
     }
 
@@ -570,7 +571,7 @@ impl RequestForwarder {
         mut self,
         sessions: Arc<super::copilot_fusion_session::FusionSessionManager>,
     ) -> Self {
-        self.copilot_fusion_sessions = Some(sessions);
+        self.copilot_fusion_sessions = sessions;
         self
     }
 
@@ -893,6 +894,7 @@ impl RequestForwarder {
             let mut budget_rectifier_retried = false;
             let mut media_rectifier_retried = false;
             let mut opaque_rectifier_retried = false;
+            let mut copilot_fusion_401_retried = false;
 
             // 上限检查：尊重用户在 AppProxyConfig.max_retries 上配置的「重试次数」。
             // 放在熔断器 allow 检查之前，避免在已经超限时还占用 HalfOpen 探测名额。
@@ -983,6 +985,44 @@ impl RequestForwarder {
                         .await);
                 }
                 Err(mut e) => {
+                    if let ProxyError::UpstreamError { status: 401, .. } = &e {
+                        if provider.is_copilot_fusion() && !copilot_fusion_401_retried {
+                            let _ = std::mem::replace(&mut copilot_fusion_401_retried, true);
+                            log::info!(
+                                "[{app_type_str}] [Copilot/Fusion] 401 Unauthorized; session invalidated, retrying once with fresh resolution"
+                            );
+                            match self
+                                .forward(
+                                    app_type,
+                                    &method,
+                                    provider,
+                                    endpoint,
+                                    &provider_body,
+                                    &headers,
+                                    &extensions,
+                                    adapter.as_ref(),
+                                    &mut attempted_codex_upstream_format,
+                                )
+                                .await
+                            {
+                                Ok(forwarded) => {
+                                    return Ok(self
+                                        .finish_success(
+                                            provider,
+                                            app_type_str,
+                                            used_half_open_permit,
+                                            forwarded,
+                                            attempted_codex_upstream_format,
+                                        )
+                                        .await);
+                                }
+                                Err(retry_err) => {
+                                    e = retry_err;
+                                }
+                            }
+                        }
+                    }
+
                     // 检测是否需要触发整流器（上游为 Anthropic Messages 的供应商）
                     let is_anthropic_provider = uses_anthropic_rectifiers(
                         ProviderType::from_app_type_and_config(app_type, provider),
@@ -1486,6 +1526,69 @@ impl RequestForwarder {
         // GitHub Copilot API 使用 /chat/completions（无 /v1 前缀）
         let is_copilot = is_managed_copilot_request(app_type, provider, &base_url);
 
+        let mut copilot_token_opt: Option<String> = None;
+        let mut copilot_credential_gen = 1u64;
+        let copilot_account_id = if is_copilot {
+            provider
+                .meta
+                .as_ref()
+                .and_then(|m| m.managed_account_id_for("github_copilot"))
+        } else {
+            None
+        };
+        let mut resolved_copilot_account_id: Option<String> = copilot_account_id.clone();
+
+        if is_copilot {
+            if let Some(app_handle) = &self.app_handle {
+                let copilot_state = app_handle.state::<CopilotAuthState>();
+                let copilot_auth = copilot_state.0.read().await;
+
+                copilot_credential_gen = copilot_auth.get_credential_generation();
+
+                if resolved_copilot_account_id.is_none() {
+                    resolved_copilot_account_id = copilot_auth.resolve_default_account_id().await;
+                }
+
+                if !is_full_url {
+                    let dynamic_endpoint = match &copilot_account_id {
+                        Some(id) => copilot_auth.get_api_endpoint(id).await,
+                        None => copilot_auth.get_default_api_endpoint().await,
+                    };
+                    if dynamic_endpoint != base_url {
+                        log::debug!(
+                            "[Copilot] 使用动态 API endpoint: {} (原: {})",
+                            dynamic_endpoint,
+                            base_url
+                        );
+                        base_url = dynamic_endpoint;
+                    }
+                }
+
+                let token_result = match &copilot_account_id {
+                    Some(id) => copilot_auth.get_valid_token_for_account(id).await,
+                    None => copilot_auth.get_valid_token().await,
+                };
+                match token_result {
+                    Ok(token) => {
+                        copilot_token_opt = Some(token);
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "[Copilot] 获取 Copilot token 失败 (account={}): {e}",
+                            copilot_account_id.as_deref().unwrap_or("default")
+                        );
+                        return Err(ProxyError::AuthError(format!(
+                            "GitHub Copilot 认证失败: {e}"
+                        )));
+                    }
+                }
+            } else if let Some(auth) = adapter.extract_auth(provider) {
+                if !auth.api_key.is_empty() && auth.api_key != "copilot_placeholder" {
+                    copilot_token_opt = Some(auth.api_key);
+                }
+            }
+        }
+
         // Codex upstream conversion mode — computed early because the [1m]-suffix strip
         // below must be skipped on the Anthropic path (the marker has to survive to
         // catalog matching and to the transform's own strip+beta detection).
@@ -1625,8 +1728,10 @@ impl RequestForwarder {
         if is_copilot_claude_body {
             mapped_body =
                 super::providers::copilot_model_map::apply_copilot_model_normalization(mapped_body);
-            self.apply_copilot_live_model_resolution(provider, &mut mapped_body)
-                .await;
+            if !provider.is_copilot_fusion() {
+                self.apply_copilot_live_model_resolution(provider, &mut mapped_body)
+                    .await;
+            }
             // Strip the [1M] context marker after Copilot normalization/resolve.
             // A user's mapped value (e.g. "gpt-5.6-sol[1M]") carries [1M] as a
             // Claude Code context-capability declaration that upstream APIs reject
@@ -1682,7 +1787,10 @@ impl RequestForwarder {
             }
 
             // 4. Warmup 小模型降级
-            if self.copilot_optimizer_config.warmup_downgrade && classification.is_warmup {
+            if !provider.is_copilot_fusion()
+                && self.copilot_optimizer_config.warmup_downgrade
+                && classification.is_warmup
+            {
                 log::info!(
                     "[Copilot] Warmup 请求降级到模型: {}",
                     self.copilot_optimizer_config.warmup_model
@@ -1746,19 +1854,77 @@ impl RequestForwarder {
             self.codex_copilot_request_context(is_copilot_codex_responses, &mapped_body)
         };
 
+        let mut fusion_session_key: Option<super::copilot_fusion_session::FusionSessionKey> = None;
+        let mut fusion_session_token: Option<String> = None;
+
+        if is_copilot && provider.is_copilot_fusion() {
+            let app_namespace = match app_type {
+                AppType::Codex => "codex",
+                _ => "claude",
+            };
+            let protocol = match app_type {
+                AppType::Codex => super::providers::copilot_fusion::RequestProtocol::CodexResponses,
+                _ => super::providers::copilot_fusion::RequestProtocol::AnthropicMessages,
+            };
+            let (prompt_summary, has_image) =
+                super::providers::copilot_fusion::extract_prompt_summary_for_fusion(
+                    &mapped_body,
+                    protocol,
+                );
+
+            let key = super::copilot_fusion_session::FusionSessionKey {
+                app_namespace: app_namespace.to_string(),
+                provider_id: provider.id.clone(),
+                account_id: resolved_copilot_account_id
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string()),
+                api_base: base_url.clone(),
+                credential_generation: copilot_credential_gen,
+                client_session_id: if self.session_id.is_empty() {
+                    "default".to_string()
+                } else {
+                    self.session_id.clone()
+                },
+                branch_id: None,
+            };
+
+            let token = copilot_token_opt.as_deref().unwrap_or_default();
+            let snapshot = self
+                .copilot_fusion_sessions
+                .get_or_resolve(&key, token, &prompt_summary, has_image)
+                .await?;
+
+            log::info!(
+                "[Copilot/Fusion] Resolved session='{}' (app={}) to model='{}'",
+                key.client_session_id,
+                app_namespace,
+                snapshot.selected_model
+            );
+
+            mapped_body["model"] = serde_json::json!(snapshot.selected_model);
+            fusion_session_token = Some(snapshot.session_token);
+            fusion_session_key = Some(key);
+        }
+
         // Codex always speaks Responses to the local proxy. Resolve the final
         // Copilot model after every model rewrite, then select only a protocol
         // that the model advertises. Messages is intentionally not supported
         // on the Codex bridge. Only auto mode may fall back from Responses to Chat.
         if is_copilot_codex_responses {
-            let api_format = CodexCopilotApiFormat::from_meta(provider.meta.as_ref());
-            let resolved = self
-                .resolve_codex_copilot_model(provider, &mapped_body, api_format)
-                .await?;
-            let transport = apply_codex_copilot_model(&mut mapped_body, resolved, api_format)?;
-            copilot_endpoint_override = Some(transport.endpoint);
-            codex_responses_to_chat = matches!(transport.protocol, CopilotProtocol::Chat);
-            codex_responses_to_anthropic = false;
+            if provider.is_copilot_fusion() {
+                copilot_endpoint_override = Some("/responses".to_string());
+                codex_responses_to_chat = false;
+                codex_responses_to_anthropic = false;
+            } else {
+                let api_format = CodexCopilotApiFormat::from_meta(provider.meta.as_ref());
+                let resolved = self
+                    .resolve_codex_copilot_model(provider, &mapped_body, api_format)
+                    .await?;
+                let transport = apply_codex_copilot_model(&mut mapped_body, resolved, api_format)?;
+                copilot_endpoint_override = Some(transport.endpoint);
+                codex_responses_to_chat = matches!(transport.protocol, CopilotProtocol::Chat);
+                codex_responses_to_anthropic = false;
+            }
         }
 
         let codex_upstream_format = if matches!(app_type, AppType::Codex | AppType::GrokBuild)
@@ -1776,35 +1942,6 @@ impl RequestForwarder {
         };
         *codex_upstream_format_out = codex_upstream_format;
 
-        // GitHub Copilot 动态 endpoint 路由
-        // 从 CopilotAuthManager 获取缓存的 API endpoint（支持企业版等非默认 endpoint）
-        if is_copilot && !is_full_url {
-            if let Some(app_handle) = &self.app_handle {
-                let copilot_state = app_handle.state::<CopilotAuthState>();
-                let copilot_auth = copilot_state.0.read().await;
-
-                // 从 provider.meta 获取关联的 GitHub 账号 ID
-                let account_id = provider
-                    .meta
-                    .as_ref()
-                    .and_then(|m| m.managed_account_id_for("github_copilot"));
-
-                let dynamic_endpoint = match &account_id {
-                    Some(id) => copilot_auth.get_api_endpoint(id).await,
-                    None => copilot_auth.get_default_api_endpoint().await,
-                };
-
-                // 只在动态 endpoint 与当前 base_url 不同时替换
-                if dynamic_endpoint != base_url {
-                    log::debug!(
-                        "[Copilot] 使用动态 API endpoint: {} (原: {})",
-                        dynamic_endpoint,
-                        base_url
-                    );
-                    base_url = dynamic_endpoint;
-                }
-            }
-        }
         let resolved_claude_api_format = if adapter.name() == "Claude" {
             Some(
                 self.resolve_claude_api_format(provider, &mapped_body, is_copilot)
@@ -2232,7 +2369,15 @@ impl RequestForwarder {
         let mut auth_headers = if let Some(mut auth) = adapter.extract_auth(provider) {
             // GitHub Copilot 特殊处理：从 CopilotAuthManager 获取真实 token
             if auth.strategy == AuthStrategy::GitHubCopilot {
-                if let Some(app_handle) = &self.app_handle {
+                if let Some(tok) = copilot_token_opt.as_ref() {
+                    auth = AuthInfo::new(tok.clone(), AuthStrategy::GitHubCopilot);
+                    log::debug!(
+                        "[Copilot] 成功获取 Copilot token (account={})",
+                        copilot_account_id.as_deref().unwrap_or("default")
+                    );
+                } else if !auth.api_key.is_empty() && auth.api_key != "copilot_placeholder" {
+                    log::debug!("[Copilot] 使用静态 token（测试模式）");
+                } else if let Some(app_handle) = &self.app_handle {
                     let copilot_state = app_handle.state::<CopilotAuthState>();
                     let copilot_auth: tokio::sync::RwLockReadGuard<'_, CopilotAuthManager> =
                         copilot_state.0.read().await;
@@ -2392,9 +2537,21 @@ impl RequestForwarder {
                 }
             }
 
-            adapter.get_auth_headers(&auth)?
+            let mut headers = adapter.get_auth_headers(&auth)?;
+            if let Some(ref session_tok) = fusion_session_token {
+                if let Ok(hv) = http::HeaderValue::from_str(session_tok) {
+                    headers.push((http::HeaderName::from_static("copilot-session-token"), hv));
+                }
+            }
+            headers
         } else {
-            Vec::new()
+            let mut headers = Vec::new();
+            if let Some(ref session_tok) = fusion_session_token {
+                if let Ok(hv) = http::HeaderValue::from_str(session_tok) {
+                    headers.push((http::HeaderName::from_static("copilot-session-token"), hv));
+                }
+            }
+            headers
         };
 
         let codex_oauth_session_headers =
@@ -2447,6 +2604,10 @@ impl RequestForwarder {
                 "x-vscode-user-agent-library-version",
                 "x-request-id",
                 "x-agent-task-id",
+                // Copilot Fusion 会话令牌（由代理注入，屏蔽外部注入）
+                "copilot-session-token",
+                "session-token",
+                "session_token",
             ]
         } else {
             &[]
@@ -2950,6 +3111,11 @@ impl RequestForwarder {
         let status = response.status();
 
         if status.is_success() {
+            if is_copilot && provider.is_copilot_fusion() {
+                if let Some(key) = &fusion_session_key {
+                    self.copilot_fusion_sessions.record_turn(key).await;
+                }
+            }
             let mut response = self
                 .prepare_success_response_for_failover(response, request_is_streaming)
                 .await?;
@@ -2987,6 +3153,15 @@ impl RequestForwarder {
             Ok((response, resolved_claude_api_format, outbound_model))
         } else {
             let status_code = status.as_u16();
+            if status_code == 401 && is_copilot && provider.is_copilot_fusion() {
+                if let Some(key) = &fusion_session_key {
+                    log::warn!(
+                        "[Copilot/Fusion] 401 Unauthorized for session '{}', invalidating session token",
+                        key.client_session_id
+                    );
+                    self.copilot_fusion_sessions.invalidate(key).await;
+                }
+            }
             // 错误响应同样可能被上游压缩（content-encoding）。reqwest 未启用任何
             // 自动解压 feature，这里拿到的是原始字节；不解压的话，压缩过的错误体会
             // 在 from_utf8 处变成非 UTF-8 而被丢弃，隐藏掉上游的限流/鉴权等详情。
@@ -3306,6 +3481,9 @@ impl RequestForwarder {
     ) -> String {
         if !is_copilot {
             return super::providers::get_claude_api_format(provider).to_string();
+        }
+        if provider.is_copilot_fusion() {
+            return "openai_responses".to_string();
         }
 
         self.resolve_copilot_api_format(provider, body)
@@ -4997,7 +5175,9 @@ mod tests {
             stack_request: false,
             failover_chain: false,
             last_outbound_model: std::sync::Mutex::new(None),
-            copilot_fusion_sessions: None,
+            copilot_fusion_sessions: Arc::new(
+                crate::proxy::copilot_fusion_session::FusionSessionManager::default(),
+            ),
         }
     }
 
@@ -9263,6 +9443,149 @@ mod tests {
             assert!(!requests[1].to_string().contains("\"signature\""));
             assert_eq!(books(&fwd).await, untouched());
             assert!(breaker_untouched(&fwd, "kimi").await);
+        }
+
+        #[test]
+        fn copilot_fusion_provider_detection() {
+            let mut provider = test_provider_with_type(Some("github_copilot"));
+            assert!(!provider.is_copilot_fusion());
+
+            provider.meta.as_mut().unwrap().copilot_model_selection = Some("fixed".to_string());
+            assert!(!provider.is_copilot_fusion());
+
+            provider.meta.as_mut().unwrap().copilot_model_selection = Some("fusion".to_string());
+            assert!(provider.is_copilot_fusion());
+
+            provider.meta.as_mut().unwrap().copilot_model_selection = Some("FUSION".to_string());
+            assert!(provider.is_copilot_fusion());
+        }
+
+        #[tokio::test]
+        async fn copilot_fusion_claude_api_format_is_openai_responses() {
+            let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+            let mut provider = test_provider_with_type(Some("github_copilot"));
+            provider.meta.as_mut().unwrap().copilot_model_selection = Some("fusion".to_string());
+
+            let format = forwarder
+                .resolve_claude_api_format(&provider, &json!({"model": "claude-sonnet-4"}), true)
+                .await;
+            assert_eq!(format, "openai_responses");
+        }
+
+        #[test]
+        fn copilot_fingerprint_headers_skip_client_session_tokens() {
+            for header_name in ["copilot-session-token", "session-token", "session_token"] {
+                let copilot_fingerprint_headers = [
+                    "user-agent",
+                    "editor-version",
+                    "editor-plugin-version",
+                    "copilot-integration-id",
+                    "x-github-api-version",
+                    "openai-intent",
+                    "x-initiator",
+                    "x-interaction-type",
+                    "x-interaction-id",
+                    "x-vscode-user-agent-library-version",
+                    "x-request-id",
+                    "x-agent-task-id",
+                    "copilot-session-token",
+                    "session-token",
+                    "session_token",
+                ];
+                assert!(copilot_fingerprint_headers
+                    .iter()
+                    .any(|h| header_name.eq_ignore_ascii_case(h)));
+            }
+        }
+
+        #[tokio::test]
+        async fn copilot_fusion_session_caching_and_turn_recording() {
+            use crate::proxy::copilot_fusion_session::{
+                FusionSessionKey, FusionSessionManager, FusionSessionSnapshot,
+            };
+            use crate::proxy::providers::copilot_fusion::CopilotAutoMultiTurnConfig;
+            use std::time::Instant;
+
+            let manager = Arc::new(FusionSessionManager::new());
+            let key = FusionSessionKey {
+                app_namespace: "codex".to_string(),
+                provider_id: "prov-1".to_string(),
+                account_id: "acc-1".to_string(),
+                api_base: "https://api.githubcopilot.com".to_string(),
+                credential_generation: 1,
+                client_session_id: "sess-123".to_string(),
+                branch_id: None,
+            };
+
+            let snapshot = FusionSessionSnapshot {
+                selected_model: "gpt-5.6-luna".to_string(),
+                session_token: "mock-jwt".to_string(),
+                created_at: Instant::now(),
+                expires_at: Some(Instant::now() + Duration::from_secs(3600)),
+                multi_turn: Some(CopilotAutoMultiTurnConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                multi_turn_mode: None,
+                credential_generation: 1,
+            };
+
+            manager.insert(key.clone(), snapshot).await;
+
+            let retrieved = manager.get(&key).await.expect("must be cached");
+            assert_eq!(retrieved.selected_model, "gpt-5.6-luna");
+
+            manager.record_turn(&key).await;
+            let retrieved2 = manager
+                .get(&key)
+                .await
+                .expect("must still be valid after turn");
+            assert_eq!(retrieved2.selected_model, "gpt-5.6-luna");
+
+            manager.invalidate(&key).await;
+            assert!(manager.get(&key).await.is_none());
+        }
+
+        #[tokio::test]
+        async fn copilot_fusion_multi_turn_disabled_expires_after_turn() {
+            use crate::proxy::copilot_fusion_session::{
+                FusionSessionKey, FusionSessionManager, FusionSessionSnapshot,
+            };
+            use crate::proxy::providers::copilot_fusion::CopilotAutoMultiTurnConfig;
+            use std::time::Instant;
+
+            let manager = Arc::new(FusionSessionManager::new());
+            let key = FusionSessionKey {
+                app_namespace: "claude".to_string(),
+                provider_id: "prov-1".to_string(),
+                account_id: "acc-1".to_string(),
+                api_base: "https://api.githubcopilot.com".to_string(),
+                credential_generation: 1,
+                client_session_id: "sess-no-multiturn".to_string(),
+                branch_id: None,
+            };
+
+            let snapshot = FusionSessionSnapshot {
+                selected_model: "gpt-5.6-sol".to_string(),
+                session_token: "mock-jwt".to_string(),
+                created_at: Instant::now(),
+                expires_at: Some(Instant::now() + Duration::from_secs(3600)),
+                multi_turn: Some(CopilotAutoMultiTurnConfig {
+                    enabled: false,
+                    ..Default::default()
+                }),
+                multi_turn_mode: None,
+                credential_generation: 1,
+            };
+
+            manager.insert(key.clone(), snapshot).await;
+            assert!(manager.get(&key).await.is_some());
+
+            manager.record_turn(&key).await;
+            assert!(
+                manager.get(&key).await.is_none(),
+                "when multi_turn.enabled is false, cannot reuse after turn"
+            );
         }
     }
 }
