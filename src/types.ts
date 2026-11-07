@@ -203,6 +203,9 @@ export interface ProviderMeta {
   // Managed Codex Copilot uses this instead of apiFormat. Missing/unknown means auto.
   // Keep the raw string so selections from newer versions survive an edit/save.
   codexCopilotApiFormat?: string;
+  // Copilot model selection strategy ("fixed" or "fusion").
+  // Missing/unknown defaults to "fixed".
+  copilotModelSelection?: "fixed" | "fusion";
   // 通用认证绑定
   authBinding?: AuthBinding;
   // Claude 认证字段名

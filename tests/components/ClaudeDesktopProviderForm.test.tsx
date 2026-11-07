@@ -8,6 +8,7 @@ import { createTestQueryClient } from "../utils/testQueryClient";
 
 const authState = vi.hoisted(() => ({
   codexReauthRequired: false,
+  copilotAuthenticated: false,
 }));
 const toastMocks = vi.hoisted(() => ({
   error: vi.fn(),
@@ -37,8 +38,16 @@ vi.mock("@/components/providers/forms/hooks", async (importOriginal) => {
   return {
     ...actual,
     useCopilotAuth: () => ({
-      isAuthenticated: false,
-      accounts: [],
+      isAuthenticated: authState.copilotAuthenticated,
+      accounts: authState.copilotAuthenticated
+        ? [
+            {
+              id: "copilot-default",
+              login: "copilot-user",
+              is_default: true,
+            },
+          ]
+        : [],
     }),
     useCodexOauth: () => ({
       isAuthenticated: true,
@@ -98,6 +107,7 @@ function renderForm(
 describe("ClaudeDesktopProviderForm", () => {
   beforeEach(() => {
     authState.codexReauthRequired = false;
+    authState.copilotAuthenticated = false;
     toastMocks.error.mockReset();
     modelFetchMocks.fetchCodexOauthModels.mockReset();
   });
@@ -789,5 +799,97 @@ describe("ClaudeDesktopProviderForm", () => {
       ),
     );
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("Copilot card allows toggling to Fusion Auto, hides route table, and saves copilotModelSelection fusion", async () => {
+    authState.copilotAuthenticated = true;
+    const onSubmit = vi.fn();
+    renderForm(
+      {
+        name: "Copilot Provider",
+        category: "third_party",
+        settingsConfig: {
+          env: {
+            ANTHROPIC_BASE_URL: "https://api.individual.githubcopilot.com",
+            ANTHROPIC_AUTH_TOKEN: "copilot-placeholder",
+          },
+        },
+        meta: {
+          providerType: "github_copilot",
+          claudeDesktopMode: "proxy",
+          claudeDesktopModelRoutes: {
+            "claude-sonnet-5": { model: "gpt-4o" },
+          },
+        },
+      },
+      onSubmit,
+    );
+
+    const strategyControl = screen.getByRole("combobox", {
+      name: "模型选择策略",
+    });
+    expect(strategyControl).toHaveTextContent("固定模型");
+    expect(screen.getByText("模型角色")).toBeVisible();
+
+    fireEvent.keyDown(strategyControl, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: /Fusion Auto/ }));
+
+    expect(strategyControl).toHaveTextContent("智能自适应 (Fusion Auto)");
+    expect(screen.queryByText("模型角色")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "当前已启用智能自适应选模，每次会话首轮由 Copilot /auto 动态决议最合适的模型，并在会话内自动复用。",
+      ),
+    ).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta?.copilotModelSelection).toBe("fusion");
+  });
+
+  it("Copilot card toggling back from Fusion Auto to fixed restores route mapping table and omits copilotModelSelection", async () => {
+    authState.copilotAuthenticated = true;
+    const onSubmit = vi.fn();
+    renderForm(
+      {
+        name: "Copilot Provider",
+        category: "third_party",
+        settingsConfig: {
+          env: {
+            ANTHROPIC_BASE_URL: "https://api.individual.githubcopilot.com",
+            ANTHROPIC_AUTH_TOKEN: "copilot-placeholder",
+          },
+        },
+        meta: {
+          providerType: "github_copilot",
+          copilotModelSelection: "fusion",
+          claudeDesktopMode: "proxy",
+          claudeDesktopModelRoutes: {
+            "claude-sonnet-5": { model: "gpt-4o" },
+          },
+        },
+      },
+      onSubmit,
+    );
+
+    const strategyControl = screen.getByRole("combobox", {
+      name: "模型选择策略",
+    });
+    expect(strategyControl).toHaveTextContent("智能自适应 (Fusion Auto)");
+    expect(screen.queryByText("模型角色")).not.toBeInTheDocument();
+
+    fireEvent.keyDown(strategyControl, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: "固定模型" }));
+
+    expect(strategyControl).toHaveTextContent("固定模型");
+    expect(screen.getByText("模型角色")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta?.copilotModelSelection).toBeUndefined();
   });
 });

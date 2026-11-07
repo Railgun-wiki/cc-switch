@@ -262,8 +262,7 @@
           "teamPremium": "Team 進階席位",
           "enterprise": "Enterprise"
         }
-      }
-    },
+      },
     "duplicateLiveIdsLoadFailed": "讀取設定中的供應商識別碼失敗，請先修復設定後再試",
     "editorViewFailed": "無法讀取用戶端設定檔，下方顯示的是保存的供應商設定：{{error}}",
     "editConflict": {
@@ -1956,6 +1955,12 @@
       "accountNotInAuthCenter": "授權中心裡沒有 Copilot CLI 目前登入的帳號 {{login}}。請在授權中心新增它，或在卡片裡綁定帳號。",
       "notSignedIn": "Copilot CLI 尚未登入。請執行 copilot 並用 /login 登入，或在卡片裡綁定授權中心的帳號。"
     }
+    },
+    "modelSelection": "模型選擇策略",
+    "modelSelectionFixed": "固定模型",
+    "modelSelectionFusion": "智慧自適應 (Fusion Auto)",
+    "modelSelectionFusionHint": "會話內複用自動選模結果",
+    "modelSelectionFusionActiveNotice": "目前已啟用智慧自適應選模，每次會話首輪由 Copilot /auto 動態決議最合適的模型，並在會話內自動複用。"
   },
   "codexOauth": {
     "authStatus": "驗證狀態",

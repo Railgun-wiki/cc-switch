@@ -624,4 +624,60 @@ requires_openai_auth = true`;
     expect(formatControl()).toHaveTextContent(formatLabels.auto);
     expect(screen.getByText("模型列表")).toBeVisible();
   });
+
+  it("allows selecting Fusion Auto strategy, which sets model to copilot-fusion-auto, hides fixed models, and saves copilotModelSelection fusion", async () => {
+    const onSubmit = renderForm();
+    const strategyControl = screen.getByRole("combobox", {
+      name: "模型选择策略",
+    });
+    expect(strategyControl).toHaveTextContent("固定模型");
+    expect(screen.getByText("模型列表")).toBeVisible();
+
+    fireEvent.keyDown(strategyControl, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: /Fusion Auto/ }));
+
+    expect(strategyControl).toHaveTextContent("智能自适应 (Fusion Auto)");
+    expect(screen.queryByText("模型列表")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "上游格式" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "当前已启用智能自适应选模，每次会话首轮由 Copilot /auto 动态决议最合适的模型，并在会话内自动复用。",
+      ),
+    ).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta?.copilotModelSelection).toBe("fusion");
+    const parsedConfig = JSON.parse(saved.settingsConfig);
+    expect(parsedConfig.config).toContain('model = "copilot-fusion-auto"');
+  });
+
+  it("switching from Fusion Auto back to fixed restores previous model and omits copilotModelSelection", async () => {
+    const onSubmit = renderForm();
+    const strategyControl = screen.getByRole("combobox", {
+      name: "模型选择策略",
+    });
+
+    // Switch to fusion
+    fireEvent.keyDown(strategyControl, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: /Fusion Auto/ }));
+    expect(screen.queryByText("模型列表")).not.toBeInTheDocument();
+
+    // Switch back to fixed
+    fireEvent.keyDown(strategyControl, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: "固定模型" }));
+    expect(screen.getByText("模型列表")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta?.copilotModelSelection).toBeUndefined();
+    const parsedConfig = JSON.parse(saved.settingsConfig);
+    expect(parsedConfig.config).not.toContain('model = "copilot-fusion-auto"');
+  });
 });

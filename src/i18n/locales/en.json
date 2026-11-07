@@ -262,8 +262,7 @@
           "teamPremium": "Team Premium",
           "enterprise": "Enterprise"
         }
-      }
-    },
+      },
     "duplicateLiveIdsLoadFailed": "Failed to read provider identifiers from config, please fix the config and try again",
     "editorViewFailed": "Cannot read the client config file, so the saved provider configuration is shown below: {{error}}",
     "editConflict": {
@@ -1955,6 +1954,12 @@
       "accountNotInAuthCenter": "The Auth Center has no account for {{login}}, which Copilot CLI is signed in with. Add it in the Auth Center, or bind an account on this card.",
       "notSignedIn": "Copilot CLI isn't signed in. Run copilot and use /login, or bind an Auth Center account on this card."
     }
+    },
+    "modelSelection": "Model Selection",
+    "modelSelectionFixed": "Fixed Model",
+    "modelSelectionFusion": "Fusion Auto (Adaptive)",
+    "modelSelectionFusionHint": "Reuse auto-selected model across turns within the session",
+    "modelSelectionFusionActiveNotice": "Fusion Auto is currently enabled. The model for each session is dynamically resolved on the first turn and reused across subsequent turns."
   },
   "codexOauth": {
     "authStatus": "Auth status",

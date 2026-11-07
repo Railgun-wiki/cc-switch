@@ -262,8 +262,7 @@
           "teamPremium": "Team 高级席位",
           "enterprise": "Enterprise"
         }
-      }
-    },
+      },
     "duplicateLiveIdsLoadFailed": "读取配置中的供应商标识失败，请先修复配置后再试",
     "editorViewFailed": "无法读取客户端配置文件，下面显示的是保存的供应商配置：{{error}}",
     "editConflict": {
@@ -1955,6 +1954,12 @@
       "accountNotInAuthCenter": "授权中心里没有 Copilot CLI 当前登录的账号 {{login}}。请在授权中心添加它，或在卡片里绑定账号。",
       "notSignedIn": "Copilot CLI 尚未登录。请运行 copilot 并用 /login 登录，或在卡片里绑定授权中心的账号。"
     }
+    },
+    "modelSelection": "模型选择策略",
+    "modelSelectionFixed": "固定模型",
+    "modelSelectionFusion": "智能自适应 (Fusion Auto)",
+    "modelSelectionFusionHint": "会话内复用自动选模结果",
+    "modelSelectionFusionActiveNotice": "当前已启用智能自适应选模，每次会话首轮由 Copilot /auto 动态决议最合适的模型，并在会话内自动复用。"
   },
   "codexOauth": {
     "authStatus": "认证状态",

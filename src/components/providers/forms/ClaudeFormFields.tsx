@@ -96,6 +96,8 @@ interface ClaudeFormFieldsProps {
 
   // GitHub Copilot OAuth
   isCopilotPreset?: boolean;
+  copilotModelSelection?: "fixed" | "fusion";
+  onCopilotModelSelectionChange?: (selection: "fixed" | "fusion") => void;
   usesOAuth?: boolean;
   isCopilotAuthenticated?: boolean;
   /** 当前选中的 GitHub 账号 ID（多账号支持） */
@@ -199,6 +201,8 @@ export function ClaudeFormFields({
   isPartner,
   partnerPromotionKey,
   isCopilotPreset,
+  copilotModelSelection = "fixed",
+  onCopilotModelSelectionChange,
   usesOAuth,
   isCopilotAuthenticated,
   selectedGitHubAccountId,
@@ -1118,7 +1122,45 @@ export function ClaudeFormFields({
             </Button>
           </CollapsibleTrigger>
           <CollapsibleContent className="space-y-4 pt-2">
-            {apiFormatField}
+            {isCopilotPreset && (
+              <div className="space-y-2">
+                <FormLabel>
+                  {t("copilot.modelSelection", {
+                    defaultValue: "模型选择策略",
+                  })}
+                </FormLabel>
+                <Select
+                  value={copilotModelSelection}
+                  onValueChange={(val: "fixed" | "fusion") =>
+                    onCopilotModelSelectionChange?.(val)
+                  }
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="fixed">
+                      {t("copilot.modelSelectionFixed", {
+                        defaultValue: "固定模型",
+                      })}
+                    </SelectItem>
+                    <SelectItem value="fusion">
+                      {t("copilot.modelSelectionFusion", {
+                        defaultValue: "智能自适应 (Fusion Auto)",
+                      })}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs leading-relaxed text-fg-2">
+                  {t("copilot.modelSelectionFusionHint", {
+                    defaultValue: "会话内复用自动选模结果",
+                  })}
+                </p>
+              </div>
+            )}
+
+            {!(isCopilotPreset && copilotModelSelection === "fusion") &&
+              apiFormatField}
 
             {fullUrlToggle}
 
@@ -1130,7 +1172,16 @@ export function ClaudeFormFields({
               authFieldSelect}
 
             {/* 模型映射 */}
-            <div className="space-y-1 border-t border-border pt-2">
+            {isCopilotPreset && copilotModelSelection === "fusion" ? (
+              <div className="rounded-md border border-border bg-bg-2 p-3 text-xs leading-relaxed text-fg-2">
+                {t("copilot.modelSelectionFusionActiveNotice", {
+                  defaultValue:
+                    "当前已启用智能自适应选模，每次会话首轮由 Copilot /auto 动态决议最合适的模型，并在会话内自动复用。",
+                })}
+              </div>
+            ) : (
+              <>
+                <div className="space-y-1 border-t border-border pt-2">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-0.5">
                   <FormLabel>{t("providerForm.modelMappingLabel")}</FormLabel>
@@ -1352,6 +1403,8 @@ export function ClaudeFormFields({
                 </p>
               )}
             </div>
+              </>
+            )}
 
             {/* Copilot 的请求由转发层按 Copilot 客户端的样子发，UA 和请求覆盖都会被跳过 */}
             {!isCopilotPreset && (
