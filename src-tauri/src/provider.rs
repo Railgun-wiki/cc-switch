@@ -560,6 +560,18 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub copilot_model_selection: Option<String>,
+    /// Copilot saved fixed model across toggles
+    #[serde(
+        rename = "copilotSavedFixedModel",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub copilot_saved_fixed_model: Option<String>,
+    /// Copilot saved fixed Claude Desktop routes across toggles
+    #[serde(
+        rename = "copilotSavedFixedDesktopRoutes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub copilot_saved_fixed_desktop_routes: Option<HashMap<String, ClaudeDesktopModelRoute>>,
     /// 通用认证绑定（provider_config / managed_account）
     ///
     /// 新代码应只写入该字段；githubAccountId 仅保留兼容读取。
@@ -1844,6 +1856,43 @@ mod tests {
         assert_eq!(
             p.resolve_usage_credentials(&AppType::Claude),
             (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn copilot_meta_preserves_saved_fixed_models_and_routes() {
+        let json_input = json!({
+            "copilotModelSelection": "fusion",
+            "copilotSavedFixedModel": "gpt-5.5",
+            "copilotSavedFixedDesktopRoutes": {
+                "claude-sonnet-5": {
+                    "model": "claude-3-5-sonnet-20241022",
+                    "supports1m": true
+                }
+            }
+        });
+        let meta: ProviderMeta = serde_json::from_value(json_input).expect("deserialize meta");
+        assert_eq!(meta.copilot_model_selection.as_deref(), Some("fusion"));
+        assert_eq!(meta.copilot_saved_fixed_model.as_deref(), Some("gpt-5.5"));
+        let routes = meta
+            .copilot_saved_fixed_desktop_routes
+            .as_ref()
+            .expect("routes present");
+        assert_eq!(
+            routes.get("claude-sonnet-5").unwrap().model,
+            "claude-3-5-sonnet-20241022"
+        );
+        assert_eq!(
+            routes.get("claude-sonnet-5").unwrap().supports_1m,
+            Some(true)
+        );
+
+        let serialized = serde_json::to_value(&meta).expect("serialize meta");
+        assert_eq!(serialized["copilotModelSelection"], "fusion");
+        assert_eq!(serialized["copilotSavedFixedModel"], "gpt-5.5");
+        assert_eq!(
+            serialized["copilotSavedFixedDesktopRoutes"]["claude-sonnet-5"]["model"],
+            "claude-3-5-sonnet-20241022"
         );
     }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useQuery } from "@tanstack/react-query";
@@ -299,6 +299,21 @@ export function ClaudeDesktopProviderForm({
   const [copilotModelSelection, setCopilotModelSelection] = useState<
     "fixed" | "fusion"
   >(initialData?.meta?.copilotModelSelection === "fusion" ? "fusion" : "fixed");
+  const [savedFixedProxyRoutes, setSavedFixedProxyRoutes] = useState<
+    Record<string, ClaudeDesktopModelRoute> | undefined
+  >(() => {
+    if (initialData?.meta?.copilotSavedFixedDesktopRoutes) {
+      return initialData.meta.copilotSavedFixedDesktopRoutes;
+    }
+    const routes = initialData?.meta?.claudeDesktopModelRoutes;
+    if (
+      routes &&
+      !Object.values(routes).some((r) => r.model === "copilot-fusion-auto")
+    ) {
+      return routes;
+    }
+    return undefined;
+  });
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(
     "custom",
   );
@@ -327,6 +342,7 @@ export function ClaudeDesktopProviderForm({
     initialMode === "proxy" &&
       Object.keys(initialData?.meta?.claudeDesktopModelRoutes ?? {}).length > 0,
   );
+
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
   const { data: defaultRoutes = [] } = useQuery({
@@ -340,6 +356,59 @@ export function ClaudeDesktopProviderForm({
         envString(initialData?.settingsConfig, "ANTHROPIC_MODEL"),
       ),
     [defaultRoutes, initialData?.settingsConfig],
+  );
+
+  const handleCopilotModelSelectionChange = useCallback(
+    (next: "fixed" | "fusion") => {
+      setCopilotModelSelection(next);
+      if (next === "fusion") {
+        const currentMap = proxyRoutes.reduce<
+          Record<string, ClaudeDesktopModelRoute>
+        >((acc, route) => {
+          if (
+            route.route &&
+            route.model &&
+            route.model !== "copilot-fusion-auto"
+          ) {
+            acc[route.route] = {
+              model: route.model,
+              labelOverride: route.labelOverride || undefined,
+              supports1m: route.supports1m || undefined,
+            };
+          }
+          return acc;
+        }, {});
+        if (Object.keys(currentMap).length > 0) {
+          setSavedFixedProxyRoutes(currentMap);
+        }
+      } else {
+        const routesToRestore =
+          savedFixedProxyRoutes ??
+          initialData?.meta?.copilotSavedFixedDesktopRoutes;
+        const validRoutesToRestore =
+          routesToRestore &&
+          Object.values(routesToRestore).some(
+            (r) => r.model && r.model !== "copilot-fusion-auto",
+          )
+            ? routesToRestore
+            : undefined;
+
+        if (validRoutesToRestore && Object.keys(validRoutesToRestore).length > 0) {
+          const restored = initialRouteRows(validRoutesToRestore);
+          setProxyRoutes(normalizeProxyRows(restored));
+        } else if (defaultProxyRouteRows.length > 0) {
+          setProxyRoutes(normalizeProxyRows(defaultProxyRouteRows));
+        } else {
+          setProxyRoutes(normalizeProxyRows([]));
+        }
+      }
+    },
+    [
+      proxyRoutes,
+      savedFixedProxyRoutes,
+      initialData?.meta?.copilotSavedFixedDesktopRoutes,
+      defaultProxyRouteRows,
+    ],
   );
 
   const defaultValues: ProviderFormData = useMemo(
@@ -843,7 +912,7 @@ export function ClaudeDesktopProviderForm({
       return;
     }
 
-    const routeEntries = routes
+    let routeEntries = routes
       .map((route) => ({
         ...route,
         route: route.route.trim(),
@@ -852,29 +921,43 @@ export function ClaudeDesktopProviderForm({
       }))
       .filter((route) => route.route || route.model);
 
+    const isCopilotFusion =
+      usesAutomaticCopilotFormat && copilotModelSelection === "fusion";
+
     if (effectiveMode === "proxy") {
-      // 固定四档（Sonnet / Opus / Fable / Haiku），route_id 由 UI 生成、恒合法，
-      // 因此只要求至少填一个实际请求模型；留空档继承第一个已填档（Sonnet 优先），
-      // 对齐 Claude Code 的兜底，保证落库四档齐全、子 agent 不会找不到模型。
-      const primary = routeEntries.find((route) => route.model);
-      if (!primary) {
-        toast.error(
-          t("claudeDesktop.routesRequired", {
-            defaultValue: "至少填写一个模型映射",
+      if (isCopilotFusion) {
+        routeEntries = ROLE_ORDER.map((role) =>
+          createRouteRow({
+            route: ROLE_ROUTE_IDS[role],
+            model: "copilot-fusion-auto",
+            labelOverride: "Copilot Fusion (Auto)",
+            supports1m: false,
           }),
         );
-        return;
-      }
-      for (const route of routeEntries) {
-        if (!route.model) {
-          route.model = primary.model;
-          if (!route.labelOverride) {
-            route.labelOverride = primary.labelOverride || primary.model;
-          }
-          // 回填的是同一个上游模型，1M 能力声明应与 primary 一致，
-          // 避免同模型在不同档声明不同 1M（除非该档用户已显式勾选）。
-          if (!route.supports1m) {
-            route.supports1m = primary.supports1m;
+      } else {
+        // 固定四档（Sonnet / Opus / Fable / Haiku），route_id 由 UI 生成、恒合法，
+        // 因此只要求至少填一个实际请求模型；留空档继承第一个已填档（Sonnet 优先），
+        // 对齐 Claude Code 的兜底，保证落库四档齐全、子 agent 不会找不到模型。
+        const primary = routeEntries.find((route) => route.model);
+        if (!primary) {
+          toast.error(
+            t("claudeDesktop.routesRequired", {
+              defaultValue: "至少填写一个模型映射",
+            }),
+          );
+          return;
+        }
+        for (const route of routeEntries) {
+          if (!route.model) {
+            route.model = primary.model;
+            if (!route.labelOverride) {
+              route.labelOverride = primary.labelOverride || primary.model;
+            }
+            // 回填的是同一个上游模型，1M 能力声明应与 primary 一致，
+            // 避免同模型在不同档声明不同 1M（除非该档用户已显式勾选）。
+            if (!route.supports1m) {
+              route.supports1m = primary.supports1m;
+            }
           }
         }
       }
@@ -940,6 +1023,11 @@ export function ClaudeDesktopProviderForm({
       copilotModelSelection:
         usesAutomaticCopilotFormat && copilotModelSelection === "fusion"
           ? "fusion"
+          : undefined,
+      copilotSavedFixedDesktopRoutes:
+        usesAutomaticCopilotFormat && copilotModelSelection === "fusion"
+          ? (savedFixedProxyRoutes ??
+              initialData?.meta?.copilotSavedFixedDesktopRoutes)
           : undefined,
     };
 
@@ -1189,7 +1277,9 @@ export function ClaudeDesktopProviderForm({
                       <Select
                         value={copilotModelSelection}
                         onValueChange={(value) =>
-                          setCopilotModelSelection(value as "fixed" | "fusion")
+                          handleCopilotModelSelectionChange(
+                            value as "fixed" | "fusion",
+                          )
                         }
                       >
                         <SelectTrigger

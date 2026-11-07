@@ -892,4 +892,197 @@ describe("ClaudeDesktopProviderForm", () => {
     const saved = onSubmit.mock.calls[0][0];
     expect(saved.meta?.copilotModelSelection).toBeUndefined();
   });
+
+  it("saving custom Copilot card with Fusion Auto and empty routes auto-populates valid 4-tier routes and succeeds", async () => {
+    authState.copilotAuthenticated = true;
+    const onSubmit = vi.fn();
+    renderForm(
+      {
+        name: "Custom Copilot",
+        category: "third_party",
+        settingsConfig: {
+          env: {
+            ANTHROPIC_BASE_URL: "https://api.githubcopilot.com",
+            ANTHROPIC_AUTH_TOKEN: "copilot-placeholder",
+          },
+        },
+        meta: {
+          providerType: "github_copilot",
+          copilotModelSelection: "fusion",
+          claudeDesktopMode: "proxy",
+          claudeDesktopModelRoutes: {},
+        },
+      },
+      onSubmit,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta?.copilotModelSelection).toBe("fusion");
+    expect(saved.meta?.claudeDesktopModelRoutes?.["claude-sonnet-5"]?.model).toBe(
+      "copilot-fusion-auto",
+    );
+    expect(saved.meta?.claudeDesktopModelRoutes?.["claude-opus-5"]?.model).toBe(
+      "copilot-fusion-auto",
+    );
+  });
+
+  it("toggling from fixed to Fusion Auto and back to fixed preserves copilotSavedFixedDesktopRoutes", async () => {
+    authState.copilotAuthenticated = true;
+    const onSubmit = vi.fn();
+    renderForm(
+      {
+        name: "Copilot Provider",
+        category: "third_party",
+        settingsConfig: {
+          env: {
+            ANTHROPIC_BASE_URL: "https://api.individual.githubcopilot.com",
+            ANTHROPIC_AUTH_TOKEN: "copilot-placeholder",
+          },
+        },
+        meta: {
+          providerType: "github_copilot",
+          claudeDesktopMode: "proxy",
+          claudeDesktopModelRoutes: {
+            "claude-sonnet-5": { model: "my-custom-sonnet" },
+            "claude-opus-5": { model: "my-custom-opus" },
+          },
+        },
+      },
+      onSubmit,
+    );
+
+    const strategyControl = screen.getByRole("combobox", {
+      name: "模型选择策略",
+    });
+
+    // 1. Switch to Fusion Auto
+    fireEvent.keyDown(strategyControl, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: /Fusion Auto/ }));
+
+    // 2. Switch back to fixed
+    fireEvent.keyDown(strategyControl, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: "固定模型" }));
+
+    // 3. Save
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta?.copilotModelSelection).toBeUndefined();
+    expect(saved.meta?.claudeDesktopModelRoutes?.["claude-sonnet-5"]?.model).toBe(
+      "my-custom-sonnet",
+    );
+  });
+
+  it("reopening a saved Fusion card and switching back to fixed restores copilotSavedFixedDesktopRoutes", async () => {
+    authState.copilotAuthenticated = true;
+    const onSubmit = vi.fn();
+    renderForm(
+      {
+        name: "Copilot Provider",
+        category: "third_party",
+        settingsConfig: {
+          env: {
+            ANTHROPIC_BASE_URL: "https://api.individual.githubcopilot.com",
+            ANTHROPIC_AUTH_TOKEN: "copilot-placeholder",
+          },
+        },
+        meta: {
+          providerType: "github_copilot",
+          copilotModelSelection: "fusion",
+          claudeDesktopMode: "proxy",
+          claudeDesktopModelRoutes: {
+            "claude-sonnet-5": { model: "copilot-fusion-auto" },
+            "claude-opus-5": { model: "copilot-fusion-auto" },
+          },
+          copilotSavedFixedDesktopRoutes: {
+            "claude-sonnet-5": { model: "persisted-fixed-sonnet" },
+            "claude-opus-5": { model: "persisted-fixed-opus" },
+          },
+        },
+      },
+      onSubmit,
+    );
+
+    const strategyControl = screen.getByRole("combobox", {
+      name: "模型选择策略",
+    });
+
+    // Switch from Fusion Auto to fixed
+    fireEvent.keyDown(strategyControl, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: "固定模型" }));
+
+    // Save
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta?.copilotModelSelection).toBeUndefined();
+    expect(saved.meta?.claudeDesktopModelRoutes?.["claude-sonnet-5"]?.model).toBe(
+      "persisted-fixed-sonnet",
+    );
+    expect(saved.meta?.claudeDesktopModelRoutes?.["claude-opus-5"]?.model).toBe(
+      "persisted-fixed-opus",
+    );
+  });
+
+  it("switching from Fusion back to fixed without saved routes clears copilot-fusion-auto", async () => {
+    authState.copilotAuthenticated = true;
+    const onSubmit = vi.fn();
+    renderForm(
+      {
+        name: "Copilot Provider",
+        category: "third_party",
+        settingsConfig: {
+          env: {
+            ANTHROPIC_BASE_URL: "https://api.individual.githubcopilot.com",
+            ANTHROPIC_AUTH_TOKEN: "copilot-placeholder",
+          },
+        },
+        meta: {
+          providerType: "github_copilot",
+          copilotModelSelection: "fusion",
+          claudeDesktopMode: "proxy",
+          claudeDesktopModelRoutes: {
+            "claude-sonnet-5": { model: "copilot-fusion-auto" },
+            "claude-opus-5": { model: "copilot-fusion-auto" },
+          },
+          // No copilotSavedFixedDesktopRoutes
+        },
+      },
+      onSubmit,
+    );
+
+    const strategyControl = screen.getByRole("combobox", {
+      name: "模型选择策略",
+    });
+
+    // Switch from Fusion Auto to fixed
+    fireEvent.keyDown(strategyControl, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: "固定模型" }));
+
+    // Verify copilot-fusion-auto is completely removed from all inputs
+    expect(screen.queryAllByDisplayValue("copilot-fusion-auto")).toHaveLength(0);
+
+    // Fill in a valid model and save
+    const inputs = screen.getAllByPlaceholderText(/deepseek-v4/);
+    fireEvent.change(inputs[0], {
+      target: { value: "claude-3-5-sonnet-20241022" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta?.copilotModelSelection).toBeUndefined();
+    expect(saved.meta?.claudeDesktopModelRoutes?.["claude-sonnet-5"]?.model).toBe(
+      "claude-3-5-sonnet-20241022",
+    );
+    for (const route of Object.values(saved.meta?.claudeDesktopModelRoutes ?? {})) {
+      expect((route as any).model).not.toBe("copilot-fusion-auto");
+    }
+  });
 });

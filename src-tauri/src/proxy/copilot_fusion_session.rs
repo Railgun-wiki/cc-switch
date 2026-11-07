@@ -10,7 +10,7 @@ use super::providers::copilot_fusion::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 /// Maximum cached fusion sessions (LRU capacity)
 pub const MAX_CACHED_SESSIONS: usize = 256;
@@ -77,11 +77,40 @@ struct FusionSessionRecord {
     turns_count: u32,
 }
 
+/// RAII guard to safely remove a gate from single_flight map upon completion or cancellation
+struct SingleFlightGuard {
+    locks: Arc<std::sync::Mutex<HashMap<FusionSessionKey, Arc<tokio::sync::Mutex<()>>>>>,
+    key: FusionSessionKey,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for SingleFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut locks) = self.locks.lock() {
+            if Arc::strong_count(&self.gate) <= 2 {
+                if let Some(existing) = locks.get(&self.key) {
+                    if Arc::ptr_eq(existing, &self.gate) {
+                        locks.remove(&self.key);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Process-level manager for Copilot Fusion sessions
-#[derive(Default)]
 pub struct FusionSessionManager {
     sessions: RwLock<HashMap<FusionSessionKey, FusionSessionRecord>>,
-    single_flight: Mutex<HashMap<FusionSessionKey, Arc<Mutex<()>>>>,
+    single_flight: Arc<std::sync::Mutex<HashMap<FusionSessionKey, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl Default for FusionSessionManager {
+    fn default() -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            single_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -113,12 +142,14 @@ impl FusionSessionManager {
     }
 
     /// Resolves or retrieves a cached resolution with single-flight concurrency
+    /// bounded by the provided request timeout budget.
     pub async fn get_or_resolve(
         &self,
         key: &FusionSessionKey,
         copilot_token: &str,
         prompt: &str,
         has_image: bool,
+        timeout: Duration,
     ) -> Result<FusionSessionSnapshot, ProxyError> {
         // Fast path: cached & valid
         if let Some(snapshot) = self.get(key).await {
@@ -126,16 +157,25 @@ impl FusionSessionManager {
         }
 
         // Single-flight coordination per unique FusionSessionKey
-        let gate = {
-            let mut locks = self.single_flight.lock().await;
-            locks
+        let guard = {
+            let mut locks = self
+                .single_flight
+                .lock()
+                .map_err(|e| ProxyError::Internal(format!("single_flight lock poisoned: {e}")))?;
+            let gate = locks
                 .entry(key.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            SingleFlightGuard {
+                locks: Arc::clone(&self.single_flight),
+                key: key.clone(),
+                gate,
+            }
         };
 
-        let result = async {
-            let _guard = gate.lock().await;
+        // Enforce timeout budget across both the single-flight lock wait and the /auto network call
+        tokio::time::timeout(timeout, async {
+            let _gate_lock = guard.gate.lock().await;
 
             // Double-check cache after acquiring lock
             if let Some(snapshot) = self.get(key).await {
@@ -155,6 +195,7 @@ impl FusionSessionManager {
                 copilot_token,
                 prompt,
                 has_image,
+                timeout,
             )
             .await?;
 
@@ -164,20 +205,14 @@ impl FusionSessionManager {
             self.insert(key.clone(), snapshot.clone()).await;
 
             Ok(snapshot)
-        }
-        .await;
-
-        // Clean up lock from single_flight map if no other callers are waiting and it wasn't replaced
-        {
-            let mut locks = self.single_flight.lock().await;
-            if Arc::strong_count(&gate) <= 2
-                && locks.get(key).is_some_and(|l| Arc::ptr_eq(l, &gate))
-            {
-                locks.remove(key);
-            }
-        }
-
-        result
+        })
+        .await
+        .map_err(|_| {
+            ProxyError::Timeout(format!(
+                "Copilot Fusion resolution timed out after {:?}",
+                timeout
+            ))
+        })?
     }
 
     fn create_snapshot_from_response(
@@ -263,28 +298,56 @@ impl FusionSessionManager {
         }
     }
 
-    /// Invalidate a specific session (e.g. after 401 or explicit reset)
+    /// Invalidate a specific session only if the currently cached session token matches
+    /// the token that experienced the error. Prevents concurrent requests from deleting
+    /// a newly resolved session token (Finding 1).
+    pub async fn invalidate_if_token_matches(
+        &self,
+        key: &FusionSessionKey,
+        expected_session_token: &str,
+    ) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(record) = sessions.get(key) {
+            if record.snapshot.session_token == expected_session_token {
+                sessions.remove(key);
+                log::info!(
+                    "[Copilot/Fusion] Invalidated session '{}' matching token version",
+                    key.client_session_id
+                );
+            } else {
+                log::info!(
+                    "[Copilot/Fusion] Kept newer session '{}' (token version diverged from 401 error token)",
+                    key.client_session_id
+                );
+            }
+        }
+    }
+
+    /// Invalidate a specific session unconditionally (e.g. after explicit reset)
     pub async fn invalidate(&self, key: &FusionSessionKey) {
         let mut sessions = self.sessions.write().await;
         sessions.remove(key);
-        let mut locks = self.single_flight.lock().await;
-        locks.remove(key);
+        if let Ok(mut locks) = self.single_flight.lock() {
+            locks.remove(key);
+        }
     }
 
     /// Invalidate all sessions associated with an account (e.g. logout / account switch)
     pub async fn invalidate_account(&self, account_id: &str) {
         let mut sessions = self.sessions.write().await;
         sessions.retain(|k, _| k.account_id != account_id);
-        let mut locks = self.single_flight.lock().await;
-        locks.retain(|k, _| k.account_id != account_id);
+        if let Ok(mut locks) = self.single_flight.lock() {
+            locks.retain(|k, _| k.account_id != account_id);
+        }
     }
 
     /// Clear all cached sessions
     pub async fn clear(&self) {
         let mut sessions = self.sessions.write().await;
         sessions.clear();
-        let mut locks = self.single_flight.lock().await;
-        locks.clear();
+        if let Ok(mut locks) = self.single_flight.lock() {
+            locks.clear();
+        }
     }
 }
 
@@ -433,5 +496,101 @@ mod tests {
 
         let snapshot = manager.create_snapshot_from_response(&key, auto_resp);
         assert!(!snapshot.is_valid());
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_if_token_matches_preserves_newer_token() {
+        let manager = FusionSessionManager::new();
+        let key = dummy_key("session-concurrent", 1);
+
+        let mut old_snapshot = dummy_snapshot("gpt-5.6-luna", 1);
+        old_snapshot.session_token = "token-v1".to_string();
+
+        let mut new_snapshot = dummy_snapshot("gpt-5.6-luna", 1);
+        new_snapshot.session_token = "token-v2".to_string();
+
+        // 1. Initial state has token-v1
+        manager.insert(key.clone(), old_snapshot).await;
+
+        // 2. Request A re-resolves and stores token-v2
+        manager.insert(key.clone(), new_snapshot).await;
+
+        // Insert a dummy lock gate into single_flight to test lock preservation
+        {
+            let mut locks = manager.single_flight.lock().unwrap();
+            locks.insert(key.clone(), Arc::new(tokio::sync::Mutex::new(())));
+        }
+
+        // 3. Stale Request B returns 401 referencing token-v1
+        manager.invalidate_if_token_matches(&key, "token-v1").await;
+
+        // 4. token-v2 MUST be preserved, AND single_flight gate must NOT be evicted!
+        let current = manager
+            .get(&key)
+            .await
+            .expect("new session must not be invalidated by stale token-v1 401");
+        assert_eq!(current.session_token, "token-v2");
+        assert_eq!(
+            manager.single_flight.lock().unwrap().len(),
+            1,
+            "in-flight gate must be preserved when token diverges"
+        );
+
+        // 5. When matching token-v2 is invalidated, session is removed from cache,
+        // while active in-flight gates are preserved (handled by SingleFlightGuard upon completion/drop)
+        manager.invalidate_if_token_matches(&key, "token-v2").await;
+        assert!(manager.get(&key).await.is_none());
+        assert_eq!(manager.single_flight.lock().unwrap().len(), 1);
+
+        // 6. Explicit invalidate() clears both session and gate
+        manager.invalidate(&key).await;
+        assert_eq!(manager.single_flight.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_single_flight_guard_drop_cleans_up_map() {
+        let manager = FusionSessionManager::new();
+        let key = dummy_key("session-cancelled", 1);
+
+        {
+            let gate = {
+                let mut locks = manager.single_flight.lock().unwrap();
+                locks
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone()
+            };
+            let _guard = SingleFlightGuard {
+                locks: Arc::clone(&manager.single_flight),
+                key: key.clone(),
+                gate,
+            };
+            assert_eq!(manager.single_flight.lock().unwrap().len(), 1);
+            // _guard dropped at end of scope (simulating future cancellation / abort)
+        }
+
+        // Must be automatically cleaned up!
+        assert_eq!(manager.single_flight.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_resolve_failure_cleans_up_single_flight_map() {
+        let manager = FusionSessionManager::new();
+        let mut key = dummy_key("session-error", 1);
+        // Use unreachable local port to ensure instant failure without live network calls
+        key.api_base = "http://127.0.0.1:1".to_string();
+
+        let res = manager
+            .get_or_resolve(
+                &key,
+                "invalid-token",
+                "hello",
+                false,
+                Duration::from_millis(500),
+            )
+            .await;
+
+        assert!(res.is_err());
+        assert_eq!(manager.single_flight.lock().unwrap().len(), 0);
     }
 }

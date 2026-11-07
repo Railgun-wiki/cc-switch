@@ -206,6 +206,10 @@ export interface ProviderMeta {
   // Copilot model selection strategy ("fixed" or "fusion").
   // Missing/unknown defaults to "fixed".
   copilotModelSelection?: "fixed" | "fusion";
+  // Preserved fixed model when toggling to fusion mode, restored on toggle back.
+  copilotSavedFixedModel?: string;
+  // Preserved fixed desktop routes when toggling to fusion mode in Claude Desktop.
+  copilotSavedFixedDesktopRoutes?: Record<string, ClaudeDesktopModelRoute>;
   // 通用认证绑定
   authBinding?: AuthBinding;
   // Claude 认证字段名
