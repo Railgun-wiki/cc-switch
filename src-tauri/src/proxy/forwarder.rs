@@ -350,6 +350,13 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
+/// 记录单次尝试发往 Copilot 时所使用的账号与 Bearer 令牌，供上游 401 失败时做一致性匹配失效。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopilotAuthAttempt {
+    pub account_id: String,
+    pub token: String,
+}
+
 pub struct RequestForwarder {
     /// 共享的 ProviderRouter（持有熔断器状态）
     router: Arc<ProviderRouter>,
@@ -959,6 +966,7 @@ impl RequestForwarder {
 
             // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
             let mut attempted_codex_upstream_format = None;
+            let mut attempted_copilot_auth = None;
             match self
                 .forward(
                     app_type,
@@ -970,6 +978,7 @@ impl RequestForwarder {
                     &extensions,
                     adapter.as_ref(),
                     &mut attempted_codex_upstream_format,
+                    &mut attempted_copilot_auth,
                 )
                 .await
             {
@@ -986,11 +995,34 @@ impl RequestForwarder {
                 }
                 Err(mut e) => {
                     if let ProxyError::UpstreamError { status: 401, .. } = &e {
-                        if provider.is_copilot_fusion() && !copilot_fusion_401_retried {
+                        if (provider.is_github_copilot() || provider.is_copilot_fusion())
+                            && !copilot_fusion_401_retried
+                        {
                             let _ = std::mem::replace(&mut copilot_fusion_401_retried, true);
+                            if let Some(app_handle) = &self.app_handle {
+                                let copilot_state = app_handle.state::<CopilotAuthState>();
+                                let copilot_auth = copilot_state.0.read().await;
+                                if let Some(attempt) = &attempted_copilot_auth {
+                                    copilot_auth
+                                        .invalidate_token_if_matches(&attempt.account_id, &attempt.token)
+                                        .await;
+                                } else {
+                                    let acct = provider
+                                        .meta
+                                        .as_ref()
+                                        .and_then(|m| m.managed_account_id_for("github_copilot"));
+                                    match acct {
+                                        Some(id) => {
+                                            copilot_auth.invalidate_token_for_account(&id).await
+                                        }
+                                        None => copilot_auth.invalidate_default_token().await,
+                                    }
+                                }
+                            }
                             log::info!(
-                                "[{app_type_str}] [Copilot/Fusion] 401 Unauthorized; session invalidated, retrying once with fresh resolution"
+                                "[{app_type_str}] [Copilot] 401 Unauthorized; refreshed cached credentials, retrying once"
                             );
+                            let mut retry_copilot_auth = None;
                             match self
                                 .forward(
                                     app_type,
@@ -1002,6 +1034,7 @@ impl RequestForwarder {
                                     &extensions,
                                     adapter.as_ref(),
                                     &mut attempted_codex_upstream_format,
+                                    &mut retry_copilot_auth,
                                 )
                                 .await
                             {
@@ -1055,6 +1088,7 @@ impl RequestForwarder {
                             );
 
                             let mut media_retry_codex_upstream_format = None;
+                            let mut media_retry_copilot_auth = None;
                             match self
                                 .forward(
                                     app_type,
@@ -1066,6 +1100,7 @@ impl RequestForwarder {
                                     &extensions,
                                     adapter.as_ref(),
                                     &mut media_retry_codex_upstream_format,
+                                    &mut media_retry_copilot_auth,
                                 )
                                 .await
                             {
@@ -1190,6 +1225,7 @@ impl RequestForwarder {
                             );
 
                             let mut opaque_retry_codex_upstream_format = None;
+                            let mut opaque_retry_copilot_auth = None;
                             match self
                                 .forward(
                                     app_type,
@@ -1201,6 +1237,7 @@ impl RequestForwarder {
                                     &extensions,
                                     adapter.as_ref(),
                                     &mut opaque_retry_codex_upstream_format,
+                                    &mut opaque_retry_copilot_auth,
                                 )
                                 .await
                             {
@@ -1287,6 +1324,7 @@ impl RequestForwarder {
 
                                 // 使用同一供应商重试（不计入熔断器）
                                 let mut signature_retry_codex_upstream_format = None;
+                                let mut signature_retry_copilot_auth = None;
                                 match self
                                     .forward(
                                         app_type,
@@ -1298,6 +1336,7 @@ impl RequestForwarder {
                                         &extensions,
                                         adapter.as_ref(),
                                         &mut signature_retry_codex_upstream_format,
+                                        &mut signature_retry_copilot_auth,
                                     )
                                     .await
                                 {
@@ -1371,6 +1410,7 @@ impl RequestForwarder {
 
                             // 使用同一供应商重试（不计入熔断器）
                             let mut budget_retry_codex_upstream_format = None;
+                            let mut budget_retry_copilot_auth = None;
                             match self
                                 .forward(
                                     app_type,
@@ -1382,6 +1422,7 @@ impl RequestForwarder {
                                     &extensions,
                                     adapter.as_ref(),
                                     &mut budget_retry_codex_upstream_format,
+                                    &mut budget_retry_copilot_auth,
                                 )
                                 .await
                             {
@@ -1508,9 +1549,28 @@ impl RequestForwarder {
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
         codex_upstream_format_out: &mut Option<CodexUpstreamFormat>,
+        attempted_copilot_auth: &mut Option<CopilotAuthAttempt>,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
         *codex_upstream_format_out = None;
+        *attempted_copilot_auth = None;
         self.set_last_outbound_model(None);
+
+        let is_streaming = is_streaming_request(endpoint, body, headers);
+        let total_timeout = if is_streaming {
+            if !self.streaming_first_byte_timeout.is_zero() {
+                self.streaming_first_byte_timeout
+            } else if !self.non_streaming_timeout.is_zero() {
+                self.non_streaming_timeout
+            } else {
+                std::time::Duration::from_secs(600)
+            }
+        } else if !self.non_streaming_timeout.is_zero() {
+            self.non_streaming_timeout
+        } else {
+            std::time::Duration::from_secs(600)
+        };
+        let deadline = tokio::time::Instant::now() + total_timeout;
+
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
 
@@ -1550,7 +1610,7 @@ impl RequestForwarder {
                 }
 
                 if !is_full_url {
-                    let dynamic_endpoint = match &copilot_account_id {
+                    let dynamic_endpoint = match &resolved_copilot_account_id {
                         Some(id) => copilot_auth.get_api_endpoint(id).await,
                         None => copilot_auth.get_default_api_endpoint().await,
                     };
@@ -1564,7 +1624,7 @@ impl RequestForwarder {
                     }
                 }
 
-                let token_result = match &copilot_account_id {
+                let token_result = match &resolved_copilot_account_id {
                     Some(id) => copilot_auth.get_valid_token_for_account(id).await,
                     None => copilot_auth.get_valid_token().await,
                 };
@@ -1575,7 +1635,7 @@ impl RequestForwarder {
                     Err(e) => {
                         log::error!(
                             "[Copilot] 获取 Copilot token 失败 (account={}): {e}",
-                            copilot_account_id.as_deref().unwrap_or("default")
+                            resolved_copilot_account_id.as_deref().unwrap_or("default")
                         );
                         return Err(ProxyError::AuthError(format!(
                             "GitHub Copilot 认证失败: {e}"
@@ -1586,6 +1646,15 @@ impl RequestForwarder {
                 if !auth.api_key.is_empty() && auth.api_key != "copilot_placeholder" {
                     copilot_token_opt = Some(auth.api_key);
                 }
+            }
+
+            if let (Some(account_id), Some(token)) =
+                (resolved_copilot_account_id.as_ref(), copilot_token_opt.as_ref())
+            {
+                *attempted_copilot_auth = Some(CopilotAuthAttempt {
+                    account_id: account_id.clone(),
+                    token: token.clone(),
+                });
             }
         }
 
@@ -1858,52 +1927,74 @@ impl RequestForwarder {
         let mut fusion_session_token: Option<String> = None;
 
         if is_copilot && provider.is_copilot_fusion() {
-            let app_namespace = match app_type {
-                AppType::Codex => "codex",
-                _ => "claude",
-            };
-            let protocol = match app_type {
-                AppType::Codex => super::providers::copilot_fusion::RequestProtocol::CodexResponses,
-                _ => super::providers::copilot_fusion::RequestProtocol::AnthropicMessages,
-            };
-            let (prompt_summary, has_image) =
-                super::providers::copilot_fusion::extract_prompt_summary_for_fusion(
-                    &mapped_body,
-                    protocol,
+            if is_copilot_fusion_chat_endpoint(endpoint) {
+                return Err(ProxyError::InvalidRequest(
+                    "GitHub Copilot Fusion 模式不支持 /chat/completions 接口，仅支持 Codex (/responses) 与 Claude (/messages)".to_string(),
+                ));
+            }
+
+            if super::providers::is_codex_responses_endpoint(endpoint)
+                || is_copilot_fusion_messages_endpoint(endpoint)
+            {
+                let app_namespace = match app_type {
+                    AppType::Codex => "codex",
+                    _ => "claude",
+                };
+                let protocol = match app_type {
+                    AppType::Codex => {
+                        super::providers::copilot_fusion::RequestProtocol::CodexResponses
+                    }
+                    _ => super::providers::copilot_fusion::RequestProtocol::AnthropicMessages,
+                };
+                let (prompt_summary, has_image) =
+                    super::providers::copilot_fusion::extract_prompt_summary_for_fusion(
+                        &mapped_body,
+                        protocol,
+                    );
+
+                let key = super::copilot_fusion_session::FusionSessionKey {
+                    app_namespace: app_namespace.to_string(),
+                    provider_id: provider.id.clone(),
+                    account_id: resolved_copilot_account_id
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string()),
+                    api_base: base_url.clone(),
+                    credential_generation: copilot_credential_gen,
+                    client_session_id: if self.session_id.is_empty() {
+                        "default".to_string()
+                    } else {
+                        self.session_id.clone()
+                    },
+                    branch_id: None,
+                };
+
+                let token = copilot_token_opt.as_deref().unwrap_or_default();
+                let remaining_budget =
+                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining_budget.is_zero() {
+                    return Err(ProxyError::Timeout(format!(
+                        "Copilot Fusion 决议超时: 超时预算已耗尽 (总预算 {}s)",
+                        total_timeout.as_secs()
+                    )));
+                }
+                let resolution_timeout = remaining_budget.min(std::time::Duration::from_secs(15));
+
+                let snapshot = self
+                    .copilot_fusion_sessions
+                    .get_or_resolve(&key, token, &prompt_summary, has_image, resolution_timeout)
+                    .await?;
+
+                log::info!(
+                    "[Copilot/Fusion] Resolved session='{}' (app={}) to model='{}'",
+                    key.client_session_id,
+                    app_namespace,
+                    snapshot.selected_model
                 );
 
-            let key = super::copilot_fusion_session::FusionSessionKey {
-                app_namespace: app_namespace.to_string(),
-                provider_id: provider.id.clone(),
-                account_id: resolved_copilot_account_id
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string()),
-                api_base: base_url.clone(),
-                credential_generation: copilot_credential_gen,
-                client_session_id: if self.session_id.is_empty() {
-                    "default".to_string()
-                } else {
-                    self.session_id.clone()
-                },
-                branch_id: None,
-            };
-
-            let token = copilot_token_opt.as_deref().unwrap_or_default();
-            let snapshot = self
-                .copilot_fusion_sessions
-                .get_or_resolve(&key, token, &prompt_summary, has_image)
-                .await?;
-
-            log::info!(
-                "[Copilot/Fusion] Resolved session='{}' (app={}) to model='{}'",
-                key.client_session_id,
-                app_namespace,
-                snapshot.selected_model
-            );
-
-            mapped_body["model"] = serde_json::json!(snapshot.selected_model);
-            fusion_session_token = Some(snapshot.session_token);
-            fusion_session_key = Some(key);
+                mapped_body["model"] = serde_json::json!(snapshot.selected_model);
+                fusion_session_token = Some(snapshot.session_token);
+                fusion_session_key = Some(key);
+            }
         }
 
         // Codex always speaks Responses to the local proxy. Resolve the final
@@ -2402,6 +2493,16 @@ impl RequestForwarder {
 
                     match token_result {
                         Ok(token) => {
+                            if attempted_copilot_auth.is_none() {
+                                if let Some(acct) =
+                                    account_id.as_ref().or(resolved_copilot_account_id.as_ref())
+                                {
+                                    *attempted_copilot_auth = Some(CopilotAuthAttempt {
+                                        account_id: acct.clone(),
+                                        token: token.clone(),
+                                    });
+                                }
+                            }
                             auth = AuthInfo::new(token, AuthStrategy::GitHubCopilot);
                             log::debug!(
                                 "[Copilot] 成功获取 Copilot token (account={})",
@@ -3020,12 +3121,14 @@ impl RequestForwarder {
             && carries_encrypted_agent_task(&filtered_body))
         .then_some(filtered_body);
 
-        // 确定超时
-        let timeout = if self.non_streaming_timeout.is_zero() {
-            std::time::Duration::from_secs(600) // 默认 600 秒
-        } else {
-            self.non_streaming_timeout
-        };
+        // 确定超时（与前置决议共享截止时间）
+        let remaining_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining_timeout.is_zero() {
+            return Err(ProxyError::Timeout(format!(
+                "请求超时: 执行前超时预算已耗尽 (总预算 {}s)",
+                total_timeout.as_secs()
+            )));
+        }
 
         // 获取全局代理 URL（上游是本机地址时直连，不送进代理）
         let upstream_proxy_url: Option<String> = super::http_client::proxy_url_for(&url);
@@ -3057,18 +3160,14 @@ impl RequestForwarder {
                 // 的首包/静默期超时控制，避免长流被总时长误杀。
                 request = request.timeout(std::time::Duration::from_secs(24 * 60 * 60));
             } else if !self.non_streaming_timeout.is_zero() {
-                request = request.timeout(self.non_streaming_timeout);
+                request = request.timeout(remaining_timeout);
             }
             for (key, value) in &ordered_headers {
                 request = request.header(key, value);
             }
             let send = request.body(body_bytes).send();
             let send_result = if request_is_streaming {
-                let header_timeout = if self.streaming_first_byte_timeout.is_zero() {
-                    timeout
-                } else {
-                    self.streaming_first_byte_timeout
-                };
+                let header_timeout = remaining_timeout;
                 tokio::time::timeout(header_timeout, send)
                     .await
                     .map_err(|_| {
@@ -3095,7 +3194,7 @@ impl RequestForwarder {
                 ordered_headers,
                 extensions.clone(),
                 body_bytes,
-                timeout,
+                remaining_timeout,
                 upstream_proxy_url.as_deref(),
             )
             .await?
@@ -3117,7 +3216,11 @@ impl RequestForwarder {
                 }
             }
             let mut response = self
-                .prepare_success_response_for_failover(response, request_is_streaming)
+                .prepare_success_response_for_failover(
+                    response,
+                    request_is_streaming,
+                    Some(deadline),
+                )
                 .await?;
             // Streaming requests normally return SSE. If a compatible gateway
             // explicitly returns JSON instead, buffer and validate it inside the retry
@@ -3155,11 +3258,17 @@ impl RequestForwarder {
             let status_code = status.as_u16();
             if status_code == 401 && is_copilot && provider.is_copilot_fusion() {
                 if let Some(key) = &fusion_session_key {
-                    log::warn!(
-                        "[Copilot/Fusion] 401 Unauthorized for session '{}', invalidating session token",
-                        key.client_session_id
-                    );
-                    self.copilot_fusion_sessions.invalidate(key).await;
+                    if let Some(token) = &fusion_session_token {
+                        log::warn!(
+                            "[Copilot/Fusion] 401 Unauthorized for session '{}', invalidating matching session token",
+                            key.client_session_id
+                        );
+                        self.copilot_fusion_sessions
+                            .invalidate_if_token_matches(key, token)
+                            .await;
+                    } else {
+                        self.copilot_fusion_sessions.invalidate(key).await;
+                    }
                 }
             }
             // 错误响应同样可能被上游压缩（content-encoding）。reqwest 未启用任何
@@ -3195,9 +3304,10 @@ impl RequestForwarder {
         &self,
         response: ProxyResponse,
         request_is_streaming: bool,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<ProxyResponse, ProxyError> {
         if request_is_streaming {
-            return self.prime_streaming_response(response).await;
+            return self.prime_streaming_response(response, deadline).await;
         }
 
         if self.non_streaming_timeout.is_zero() {
@@ -3206,7 +3316,14 @@ impl RequestForwarder {
 
         let status = response.status();
         let headers = response.headers().clone();
-        let body_timeout = self.non_streaming_timeout;
+        let body_timeout = deadline
+            .map(|dl| dl.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or(self.non_streaming_timeout);
+        if body_timeout.is_zero() {
+            return Err(ProxyError::Timeout(
+                "响应体读取超时: 剩余超时预算已耗尽".to_string(),
+            ));
+        }
         let body = tokio::time::timeout(
             body_timeout,
             response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES),
@@ -3422,6 +3539,7 @@ impl RequestForwarder {
     async fn prime_streaming_response(
         &self,
         response: ProxyResponse,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<ProxyResponse, ProxyError> {
         if self.streaming_first_byte_timeout.is_zero() {
             return Ok(response);
@@ -3429,7 +3547,18 @@ impl RequestForwarder {
 
         let status = response.status();
         let headers = response.headers().clone();
-        let timeout = self.streaming_first_byte_timeout;
+        let timeout = if let Some(dl) = deadline {
+            let rem = dl.saturating_duration_since(tokio::time::Instant::now());
+            if rem.is_zero() {
+                return Err(ProxyError::Timeout(
+                    "流式响应首包超时: 剩余超时预算已耗尽（上游已返回响应头但未返回数据）"
+                        .to_string(),
+                ));
+            }
+            rem.min(self.streaming_first_byte_timeout)
+        } else {
+            self.streaming_first_byte_timeout
+        };
         let mut stream = Box::pin(response.bytes_stream());
 
         let first = tokio::time::timeout(timeout, stream.next())
@@ -3866,6 +3995,24 @@ fn strip_beta_query(query: Option<&str>) -> Option<String> {
         Some("") | None => None,
         Some(_) => filtered,
     }
+}
+
+fn is_copilot_fusion_chat_endpoint(endpoint: &str) -> bool {
+    let clean = endpoint.split('?').next().unwrap_or(endpoint);
+    clean == "/chat/completions"
+        || clean == "/v1/chat/completions"
+        || clean == "/v1/v1/chat/completions"
+        || clean == "/codex/v1/chat/completions"
+        || clean.starts_with("/chat/completions/")
+        || clean.starts_with("/v1/chat/completions/")
+}
+
+fn is_copilot_fusion_messages_endpoint(endpoint: &str) -> bool {
+    let clean = endpoint.split('?').next().unwrap_or(endpoint);
+    clean == "/v1/messages"
+        || clean == "/claude/v1/messages"
+        || clean == "/claude-desktop/v1/messages"
+        || clean.starts_with("/v1/messages/")
 }
 
 fn is_claude_messages_path(path: &str) -> bool {
@@ -5501,7 +5648,7 @@ mod tests {
         );
 
         let prepared = forwarder
-            .prepare_success_response_for_failover(response, false)
+            .prepare_success_response_for_failover(response, false, None)
             .await
             .expect("response should be buffered");
 
@@ -5526,7 +5673,7 @@ mod tests {
         );
 
         let err = match forwarder
-            .prepare_success_response_for_failover(response, false)
+            .prepare_success_response_for_failover(response, false, None)
             .await
         {
             Ok(_) => panic!("body read errors should fail the attempt"),
@@ -5549,7 +5696,7 @@ mod tests {
         );
 
         let prepared = forwarder
-            .prepare_success_response_for_failover(response, true)
+            .prepare_success_response_for_failover(response, true, None)
             .await
             .expect("stream should be primed");
 
@@ -5574,7 +5721,7 @@ mod tests {
         );
 
         let err = match forwarder
-            .prepare_success_response_for_failover(response, true)
+            .prepare_success_response_for_failover(response, true, None)
             .await
         {
             Ok(_) => panic!("first chunk errors should fail the attempt"),
@@ -6808,6 +6955,7 @@ mod tests {
                     &Extensions::new(),
                     adapter.as_ref(),
                     &mut codex_upstream_format,
+                    &mut None,
                 )
                 .await
             {
@@ -9586,6 +9734,167 @@ mod tests {
                 manager.get(&key).await.is_none(),
                 "when multi_turn.enabled is false, cannot reuse after turn"
             );
+        }
+
+        #[tokio::test]
+        async fn copilot_fusion_chat_endpoint_is_rejected() {
+            let mut provider = test_provider_with_type(Some("github_copilot"));
+            provider.meta = Some(crate::provider::ProviderMeta {
+                provider_type: Some("github_copilot".to_string()),
+                copilot_model_selection: Some("fusion".to_string()),
+                ..Default::default()
+            });
+
+            let forwarder = test_forwarder(Duration::from_secs(10), Duration::from_secs(10));
+            let body = serde_json::json!({
+                "model": "copilot-fusion-auto",
+                "messages": [{"role": "user", "content": "hello"}]
+            });
+            let headers = HeaderMap::new();
+            let extensions = http::Extensions::new();
+            let adapter =
+                crate::proxy::providers::get_adapter(&crate::app_config::AppType::Codex).unwrap();
+            let mut codex_format = None;
+
+            let result = forwarder
+                .forward(
+                    &crate::app_config::AppType::Codex,
+                    &http::Method::POST,
+                    &provider,
+                    "/v1/chat/completions",
+                    &body,
+                    &headers,
+                    &extensions,
+                    adapter.as_ref(),
+                    &mut codex_format,
+                    &mut None,
+                )
+                .await;
+
+            match result {
+                Err(ProxyError::InvalidRequest(msg)) => {
+                    assert!(
+                        msg.contains("不支持 /chat/completions"),
+                        "error message was: {msg}"
+                    );
+                }
+                Err(other) => panic!("expected ProxyError::InvalidRequest, got error: {other}"),
+                Ok(_) => panic!("expected ProxyError::InvalidRequest, got Ok"),
+            }
+        }
+
+        #[tokio::test]
+        async fn copilot_streaming_resolution_uses_streaming_first_byte_timeout() {
+            let mut provider = test_provider_with_type(Some("github_copilot"));
+            provider.settings_config = json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.individual.githubcopilot.com"
+                }
+            });
+            provider.meta = Some(crate::provider::ProviderMeta {
+                provider_type: Some("github_copilot".to_string()),
+                copilot_model_selection: Some("fusion".to_string()),
+                ..Default::default()
+            });
+
+            // non_streaming_timeout 为 60s，但流式首包超时只有 1ms
+            let forwarder = test_forwarder(Duration::from_secs(60), Duration::from_millis(1));
+            let body = serde_json::json!({
+                "model": "copilot-fusion-auto",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hello"}]
+            });
+            let headers = HeaderMap::new();
+            let extensions = http::Extensions::new();
+            let adapter =
+                crate::proxy::providers::get_adapter(&crate::app_config::AppType::Claude).unwrap();
+            let mut codex_format = None;
+            let mut copilot_auth_attempt = None;
+
+            // 给点时间让 1ms 预算用尽
+            tokio::time::sleep(Duration::from_millis(5)).await;
+
+            let result = forwarder
+                .forward(
+                    &crate::app_config::AppType::Claude,
+                    &http::Method::POST,
+                    &provider,
+                    "/v1/messages",
+                    &body,
+                    &headers,
+                    &extensions,
+                    adapter.as_ref(),
+                    &mut codex_format,
+                    &mut copilot_auth_attempt,
+                )
+                .await;
+
+            match result {
+                Err(ProxyError::Timeout(msg)) => {
+                    assert!(
+                        msg.contains("超时") || msg.contains("timed out"),
+                        "expected timeout message, got: {msg}"
+                    );
+                }
+                Err(other) => panic!("expected ProxyError::Timeout, got error: {other}"),
+                Ok(_) => panic!("expected ProxyError::Timeout, got Ok"),
+            }
+        }
+
+        #[tokio::test]
+        async fn copilot_non_streaming_shared_timeout_budget_expires() {
+            let mut provider = test_provider_with_type(Some("github_copilot"));
+            provider.settings_config = json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.individual.githubcopilot.com"
+                }
+            });
+            provider.meta = Some(crate::provider::ProviderMeta {
+                provider_type: Some("github_copilot".to_string()),
+                copilot_model_selection: Some("fusion".to_string()),
+                ..Default::default()
+            });
+
+            // 非流式超时仅 1ms
+            let forwarder = test_forwarder(Duration::from_millis(1), Duration::from_secs(60));
+            let body = serde_json::json!({
+                "model": "copilot-fusion-auto",
+                "messages": [{"role": "user", "content": "hello"}]
+            });
+            let headers = HeaderMap::new();
+            let extensions = http::Extensions::new();
+            let adapter =
+                crate::proxy::providers::get_adapter(&crate::app_config::AppType::Claude).unwrap();
+            let mut codex_format = None;
+            let mut copilot_auth_attempt = None;
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+
+            let result = forwarder
+                .forward(
+                    &crate::app_config::AppType::Claude,
+                    &http::Method::POST,
+                    &provider,
+                    "/v1/messages",
+                    &body,
+                    &headers,
+                    &extensions,
+                    adapter.as_ref(),
+                    &mut codex_format,
+                    &mut copilot_auth_attempt,
+                )
+                .await;
+
+            match result {
+                Err(ProxyError::Timeout(msg)) => {
+                    assert!(
+                        msg.contains("超时") || msg.contains("timed out"),
+                        "expected timeout message, got: {msg}"
+                    );
+                }
+                Err(other) => panic!("expected ProxyError::Timeout, got error: {other}"),
+                Ok(_) => panic!("expected ProxyError::Timeout, got Ok"),
+            }
         }
     }
 }
