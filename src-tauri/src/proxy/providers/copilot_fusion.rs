@@ -190,17 +190,14 @@ impl ParsedSessionToken {
     }
 }
 
-fn append_prompt_part(prompt: &mut String, text: &str) {
+fn append_text_block(blocks: &mut Vec<String>, text: &str) {
     let trimmed = text.trim();
     if !trimmed.is_empty() {
-        if !prompt.is_empty() {
-            prompt.push('\n');
-        }
-        prompt.push_str(trimmed);
+        blocks.push(trimmed.to_string());
     }
 }
 
-fn truncate_to_char_boundary(s: &mut String, max_bytes: usize) {
+pub fn truncate_to_char_boundary(s: &mut String, max_bytes: usize) {
     if s.len() > max_bytes {
         let mut end = max_bytes;
         while end > 0 && !s.is_char_boundary(end) {
@@ -210,13 +207,71 @@ fn truncate_to_char_boundary(s: &mut String, max_bytes: usize) {
     }
 }
 
+/// Assembles prompt messages under `max_bytes` budget, prioritizing the latest user task.
+/// If history exceeds budget, the latest message is fully preserved while preceding messages
+/// fill the remaining budget from newest to oldest (preserving chronological order when output).
+fn assemble_prompt_with_budget(messages: Vec<String>, max_bytes: usize) -> String {
+    if messages.is_empty() {
+        return "Assist with coding task".to_string();
+    }
+    let total_len: usize =
+        messages.iter().map(|p| p.len()).sum::<usize>() + messages.len().saturating_sub(1);
+    if total_len <= max_bytes {
+        return messages.join("\n");
+    }
+
+    let mut messages = messages;
+    let mut latest = messages.pop().unwrap_or_default();
+    if latest.len() >= max_bytes {
+        truncate_to_char_boundary(&mut latest, max_bytes);
+        return latest;
+    }
+
+    let remaining_budget = max_bytes.saturating_sub(latest.len());
+    let mut selected_earlier: Vec<String> = Vec::new();
+    let mut remaining = remaining_budget;
+
+    for message in messages.into_iter().rev() {
+        let needed = message.len() + 1;
+        if remaining >= needed {
+            remaining -= needed;
+            selected_earlier.push(message);
+        } else if remaining > 32 {
+            let avail = remaining.saturating_sub(1);
+            let mut slice = message;
+            if slice.len() > avail {
+                let start = slice.len().saturating_sub(avail);
+                let mut valid_start = start;
+                while valid_start < slice.len() && !slice.is_char_boundary(valid_start) {
+                    valid_start += 1;
+                }
+                slice = slice[valid_start..].to_string();
+            }
+            if !slice.is_empty() {
+                selected_earlier.push(slice);
+            }
+            break;
+        } else {
+            break;
+        }
+    }
+
+    selected_earlier.reverse();
+    selected_earlier.push(latest);
+    selected_earlier.join("\n")
+}
+
 /// Extract prompt text and image presence across Anthropic Messages, Codex Responses,
-/// and Chat Completions protocols. Safely bounded to 4000 bytes on valid UTF-8 boundaries.
+/// and Chat Completions protocols. Safely bounded to 4000 bytes on valid UTF-8 boundaries,
+/// prioritizing the most recent user turn.
+///
+/// Prompts are grouped by user message before budget allocation so that multi-part content
+/// (e.g. an instruction followed by a large code block) preserves the user's task instruction.
 pub fn extract_prompt_summary_for_fusion(
     request_body: &serde_json::Value,
     protocol: RequestProtocol,
 ) -> (String, bool) {
-    let mut prompt = String::new();
+    let mut user_messages: Vec<String> = Vec::new();
     let mut has_image = false;
 
     match protocol {
@@ -225,11 +280,12 @@ pub fn extract_prompt_summary_for_fusion(
                 for msg in messages {
                     let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
                     if role == "user" {
+                        let mut msg_blocks: Vec<String> = Vec::new();
                         if let Some(content) = msg.get("content") {
                             if let Some(text) = content.as_str() {
-                                append_prompt_part(&mut prompt, text);
-                            } else if let Some(parts) = content.as_array() {
-                                for part in parts {
+                                append_text_block(&mut msg_blocks, text);
+                            } else if let Some(msg_parts) = content.as_array() {
+                                for part in msg_parts {
                                     let part_type =
                                         part.get("type").and_then(|v| v.as_str()).unwrap_or("");
                                     if part_type == "image" {
@@ -238,11 +294,14 @@ pub fn extract_prompt_summary_for_fusion(
                                         if let Some(text) =
                                             part.get("text").and_then(|v| v.as_str())
                                         {
-                                            append_prompt_part(&mut prompt, text);
+                                            append_text_block(&mut msg_blocks, text);
                                         }
                                     }
                                 }
                             }
+                        }
+                        if !msg_blocks.is_empty() {
+                            user_messages.push(msg_blocks.join("\n"));
                         }
                     }
                 }
@@ -251,13 +310,17 @@ pub fn extract_prompt_summary_for_fusion(
         RequestProtocol::CodexResponses => {
             if let Some(input_val) = request_body.get("input") {
                 if let Some(text) = input_val.as_str() {
-                    append_prompt_part(&mut prompt, text);
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        user_messages.push(trimmed.to_string());
+                    }
                 } else if let Some(input) = input_val.as_array() {
+                    let mut top_level_blocks: Vec<String> = Vec::new();
                     for item in input {
                         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         if item_type == "input_text" || item_type == "text" {
                             if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                append_prompt_part(&mut prompt, text);
+                                append_text_block(&mut top_level_blocks, text);
                             }
                         } else if item_type == "input_image"
                             || item_type == "image_url"
@@ -265,13 +328,18 @@ pub fn extract_prompt_summary_for_fusion(
                         {
                             has_image = true;
                         } else {
+                            if !top_level_blocks.is_empty() {
+                                user_messages.push(top_level_blocks.join("\n"));
+                                top_level_blocks.clear();
+                            }
                             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
                             if role == "user" || (role.is_empty() && item_type == "message") {
+                                let mut msg_blocks: Vec<String> = Vec::new();
                                 if let Some(content) = item.get("content") {
                                     if let Some(text) = content.as_str() {
-                                        append_prompt_part(&mut prompt, text);
-                                    } else if let Some(parts) = content.as_array() {
-                                        for part in parts {
+                                        append_text_block(&mut msg_blocks, text);
+                                    } else if let Some(item_parts) = content.as_array() {
+                                        for part in item_parts {
                                             let part_type = part
                                                 .get("type")
                                                 .and_then(|v| v.as_str())
@@ -287,14 +355,20 @@ pub fn extract_prompt_summary_for_fusion(
                                                 if let Some(text) =
                                                     part.get("text").and_then(|v| v.as_str())
                                                 {
-                                                    append_prompt_part(&mut prompt, text);
+                                                    append_text_block(&mut msg_blocks, text);
                                                 }
                                             }
                                         }
                                     }
                                 }
+                                if !msg_blocks.is_empty() {
+                                    user_messages.push(msg_blocks.join("\n"));
+                                }
                             }
                         }
+                    }
+                    if !top_level_blocks.is_empty() {
+                        user_messages.push(top_level_blocks.join("\n"));
                     }
                 }
             }
@@ -304,11 +378,12 @@ pub fn extract_prompt_summary_for_fusion(
                 for msg in messages {
                     let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
                     if role == "user" {
+                        let mut msg_blocks: Vec<String> = Vec::new();
                         if let Some(content) = msg.get("content") {
                             if let Some(text) = content.as_str() {
-                                append_prompt_part(&mut prompt, text);
-                            } else if let Some(parts) = content.as_array() {
-                                for part in parts {
+                                append_text_block(&mut msg_blocks, text);
+                            } else if let Some(msg_parts) = content.as_array() {
+                                for part in msg_parts {
                                     let part_type =
                                         part.get("type").and_then(|v| v.as_str()).unwrap_or("");
                                     if part_type == "image_url" {
@@ -317,11 +392,14 @@ pub fn extract_prompt_summary_for_fusion(
                                         if let Some(text) =
                                             part.get("text").and_then(|v| v.as_str())
                                         {
-                                            append_prompt_part(&mut prompt, text);
+                                            append_text_block(&mut msg_blocks, text);
                                         }
                                     }
                                 }
                             }
+                        }
+                        if !msg_blocks.is_empty() {
+                            user_messages.push(msg_blocks.join("\n"));
                         }
                     }
                 }
@@ -329,10 +407,7 @@ pub fn extract_prompt_summary_for_fusion(
         }
     }
 
-    if prompt.is_empty() {
-        prompt = "Assist with coding task".to_string();
-    }
-    truncate_to_char_boundary(&mut prompt, 4000);
+    let prompt = assemble_prompt_with_budget(user_messages, 4000);
     (prompt, has_image)
 }
 
@@ -347,6 +422,7 @@ impl CopilotFusionClient {
         copilot_token: &str,
         prompt: &str,
         has_image: bool,
+        timeout: std::time::Duration,
     ) -> Result<CopilotAutoResponse, ProxyError> {
         let clean_base = api_base.trim_end_matches('/');
         let url = format!("{clean_base}/auto");
@@ -376,7 +452,7 @@ impl CopilotFusionClient {
             .header("X-Github-Api-Version", COPILOT_FUSION_API_VERSION)
             .header("X-Initiator", "user")
             .header("X-Interaction-Id", interaction_id)
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(timeout)
             .json(&request_body)
             .send()
             .await
@@ -555,6 +631,27 @@ mod tests {
     }
 
     #[test]
+    fn test_long_history_preserves_latest_user_task() {
+        // Turn 1 is very long (> 4000 bytes)
+        let turn1 = "A".repeat(5000);
+        let turn2 = "LATEST_USER_QUESTION: please refactor my code";
+        let req = json!({
+            "messages": [
+                {"role": "user", "content": turn1},
+                {"role": "assistant", "content": "Done."},
+                {"role": "user", "content": turn2}
+            ]
+        });
+        let (prompt, _) =
+            extract_prompt_summary_for_fusion(&req, RequestProtocol::AnthropicMessages);
+        assert!(
+            prompt.ends_with("LATEST_USER_QUESTION: please refactor my code"),
+            "prompt should preserve the latest task, but was: {prompt}"
+        );
+        assert!(prompt.len() <= 4000);
+    }
+
+    #[test]
     fn test_parsed_session_token_with_base64_padding() {
         let payload = json!({
             "exp": 1794116452,
@@ -673,5 +770,60 @@ mod tests {
         let (prompt, _) =
             extract_prompt_summary_for_fusion(&req, RequestProtocol::AnthropicMessages);
         assert_eq!(prompt, "First question\nFollow up question");
+    }
+
+    #[test]
+    fn test_extract_prompt_summary_message_with_instruction_and_large_code_block() {
+        let large_code = "fn do_something() {\n".to_string()
+            + &"    println!(\"hello\");\n".repeat(300)
+            + "}";
+        assert!(large_code.len() > 4000);
+        let req = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请审查下面代码"},
+                        {"type": "text", "text": large_code}
+                    ]
+                }
+            ]
+        });
+        let (prompt, _) =
+            extract_prompt_summary_for_fusion(&req, RequestProtocol::AnthropicMessages);
+        assert!(
+            prompt.starts_with("请审查下面代码"),
+            "Prompt must preserve user instruction at the start of the message, but was: {prompt}"
+        );
+        assert!(prompt.len() <= 4000);
+        assert!(std::str::from_utf8(prompt.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_extract_prompt_summary_responses_message_with_instruction_and_large_code_block() {
+        let large_code = "fn do_something() {\n".to_string()
+            + &"    println!(\"hello\");\n".repeat(300)
+            + "}";
+        assert!(large_code.len() > 4000);
+        let req = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "请审查下面代码"},
+                        {"type": "input_text", "text": large_code}
+                    ]
+                }
+            ]
+        });
+        let (prompt, _) =
+            extract_prompt_summary_for_fusion(&req, RequestProtocol::CodexResponses);
+        assert!(
+            prompt.starts_with("请审查下面代码"),
+            "Prompt must preserve user instruction at the start of the message, but was: {prompt}"
+        );
+        assert!(prompt.len() <= 4000);
+        assert!(std::str::from_utf8(prompt.as_bytes()).is_ok());
     }
 }
