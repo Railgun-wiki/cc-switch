@@ -680,4 +680,56 @@ requires_openai_auth = true`;
     const parsedConfig = JSON.parse(saved.settingsConfig);
     expect(parsedConfig.config).not.toContain('model = "copilot-fusion-auto"');
   });
+
+  it("reopening a saved Fusion card and switching back to fixed restores copilotSavedFixedModel", async () => {
+    const config = [
+      'model = "copilot-fusion-auto"',
+      'model_provider = "copilot"',
+    ].join("\n");
+
+    const onSubmit = vi.fn();
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <ProviderForm
+          appId="codex"
+          providerId="copilot-test"
+          submitLabel="save"
+          onSubmit={onSubmit}
+          onCancel={vi.fn()}
+          initialData={{
+            name: "GitHub Copilot",
+            category: "third_party",
+            settingsConfig: {
+              auth: { GITHUB_TOKEN: "gh-token" },
+              config,
+            },
+            meta: {
+              providerType: "github_copilot",
+              copilotModelSelection: "fusion",
+              copilotSavedFixedModel: "claude-sonnet-4",
+            },
+          }}
+        />
+      </QueryClientProvider>,
+    );
+
+    const strategyControl = screen.getByRole("combobox", {
+      name: "模型选择策略",
+    });
+    expect(strategyControl).toHaveTextContent("智能自适应 (Fusion Auto)");
+
+    // Switch back to fixed
+    fireEvent.keyDown(strategyControl, { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: "固定模型" }));
+    expect(screen.getByText("模型列表")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+
+    const saved = onSubmit.mock.calls[0][0];
+    expect(saved.meta?.copilotModelSelection).toBeUndefined();
+    expect(saved.meta?.copilotSavedFixedModel).toBeUndefined();
+    const parsedConfig = JSON.parse(saved.settingsConfig);
+    expect(parsedConfig.config).toContain('model = "claude-sonnet-4"');
+  });
 });

@@ -838,6 +838,9 @@ function ProviderFormFull({
 
   const [savedFixedCodexModel, setSavedFixedCodexModel] = useState<string>(
     () => {
+      if (initialData?.meta?.copilotSavedFixedModel) {
+        return initialData.meta.copilotSavedFixedModel;
+      }
       const current =
         extractCodexModelName(
           typeof initialData?.settingsConfig?.config === "string"
@@ -2133,6 +2136,13 @@ function ProviderFormFull({
       copilotModelSelection:
         isCopilotProvider && copilotModelSelection === "fusion"
           ? "fusion"
+          : undefined,
+      copilotSavedFixedModel:
+        isCopilotProvider &&
+        copilotModelSelection === "fusion" &&
+        savedFixedCodexModel &&
+        savedFixedCodexModel !== "copilot-fusion-auto"
+          ? savedFixedCodexModel
           : undefined,
       apiKeyField:
         appId === "claude" &&
