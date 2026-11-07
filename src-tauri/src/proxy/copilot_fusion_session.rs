@@ -150,7 +150,7 @@ impl FusionSessionManager {
             );
 
             let response = CopilotFusionClient::resolve(
-                &crate::proxy::http_client::get(),
+                &crate::proxy::http_client::get_for_url(&key.api_base),
                 &key.api_base,
                 copilot_token,
                 prompt,
