@@ -271,6 +271,7 @@ pub struct CopilotModel {
     /// 模型供应商
     pub vendor: String,
     /// 是否在模型选择器中显示
+    #[serde(default)]
     pub model_picker_enabled: bool,
     /// Copilot-reported maximum prompt limit for this exact model ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,6 +312,7 @@ struct CopilotModelsResponseItem {
     id: String,
     name: String,
     vendor: String,
+    #[serde(default)]
     model_picker_enabled: bool,
     #[serde(default)]
     supported_endpoints: Vec<String>,
@@ -940,17 +942,12 @@ impl CopilotAuthManager {
 
     // ==================== 模型和使用量 ====================
 
-    /// 获取指定账号的 Copilot 可用模型列表
+    /// 获取指定账号的 Copilot 可用模型列表（返回完整目录，不再受 model_picker_enabled 客户端过滤限制）
     pub async fn fetch_models_for_account(
         &self,
         account_id: &str,
     ) -> Result<Vec<CopilotModel>, CopilotAuthError> {
-        Ok(self
-            .fetch_all_models_for_account(account_id)
-            .await?
-            .into_iter()
-            .filter(|model| model.model_picker_enabled)
-            .collect())
+        self.fetch_all_models_for_account(account_id).await
     }
 
     async fn fetch_all_models_for_account(
@@ -2153,12 +2150,15 @@ mod tests {
                 Some(account_model)
             );
         }
-        assert!(manager
-            .fetch_models_for_account("12345")
-            .await
-            .unwrap()
-            .iter()
-            .all(|model| model.id != "gpt-hidden"));
+        let models = manager.fetch_models_for_account("12345").await.unwrap();
+        assert_eq!(models.len(), 3);
+        let hidden = models.iter().find(|m| m.id == "gpt-hidden").unwrap();
+        assert!(!hidden.model_picker_enabled);
+        assert_eq!(hidden.context_window, Some(128_000));
+        assert_eq!(
+            hidden.supported_endpoints,
+            vec!["/v1/chat/completions", "/responses"]
+        );
     }
 
     #[tokio::test]
@@ -2188,11 +2188,10 @@ mod tests {
         ]);
 
         for account in ["messages-only", "no-metadata"] {
-            assert!(manager
-                .fetch_models_for_account(account)
-                .await
-                .unwrap()
-                .is_empty());
+            let models = manager.fetch_models_for_account(account).await.unwrap();
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].id, "claude-opus-4.7");
+            assert!(!models[0].model_picker_enabled);
             assert_eq!(
                 manager
                     .get_model_vendor_for_account(account, "claude-opus-4-8")
@@ -2235,6 +2234,144 @@ mod tests {
                 endpoint: "/chat/completions".to_string(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_models_returns_full_catalog_including_hidden_models_with_account_isolation()
+    {
+        let temp_dir = tempdir().unwrap();
+        let manager = CopilotAuthManager::new(temp_dir.path().to_path_buf());
+
+        // 设置默认账号 account_a 和另一个账号 account_b
+        *manager.default_account_id.write().await = Some("account_a".to_string());
+        manager.accounts.write().await.extend([
+            (
+                "account_a".to_string(),
+                GitHubAccountData {
+                    github_token: "gho_a".to_string(),
+                    user: GitHubUser {
+                        login: "user_a".to_string(),
+                        id: 111,
+                        avatar_url: None,
+                    },
+                    authenticated_at: 1700000000,
+                    github_domain: DEFAULT_GITHUB_DOMAIN.to_string(),
+                },
+            ),
+            (
+                "account_b".to_string(),
+                GitHubAccountData {
+                    github_token: "gho_b".to_string(),
+                    user: GitHubUser {
+                        login: "user_b".to_string(),
+                        id: 222,
+                        avatar_url: None,
+                    },
+                    authenticated_at: 1700000000,
+                    github_domain: DEFAULT_GITHUB_DOMAIN.to_string(),
+                },
+            ),
+        ]);
+
+        let model_visible = CopilotModel {
+            id: "gpt-5.4".to_string(),
+            name: "GPT-5.4".to_string(),
+            vendor: "OpenAI".to_string(),
+            model_picker_enabled: true,
+            context_window: Some(200_000),
+            supported_endpoints: vec!["/chat/completions".to_string()],
+            supports_parallel_tool_calls: Some(true),
+            reasoning_effort: Some(vec![
+                CopilotReasoningEffort::Low,
+                CopilotReasoningEffort::Medium,
+                CopilotReasoningEffort::High,
+            ]),
+        };
+
+        let model_hidden = CopilotModel {
+            id: "gpt-5.6-luna".to_string(),
+            name: "GPT-5.6 Luna".to_string(),
+            vendor: "OpenAI".to_string(),
+            model_picker_enabled: false,
+            context_window: Some(922_000),
+            supported_endpoints: vec!["/responses".to_string(), "ws:/responses".to_string()],
+            supports_parallel_tool_calls: Some(true),
+            reasoning_effort: Some(vec![
+                CopilotReasoningEffort::None,
+                CopilotReasoningEffort::Low,
+                CopilotReasoningEffort::Medium,
+            ]),
+        };
+
+        let model_account_b = CopilotModel {
+            id: "kimi-k3".to_string(),
+            name: "Kimi K3".to_string(),
+            vendor: "Moonshot AI".to_string(),
+            model_picker_enabled: false,
+            context_window: Some(128_000),
+            supported_endpoints: vec!["/chat/completions".to_string()],
+            supports_parallel_tool_calls: None,
+            reasoning_effort: None,
+        };
+
+        manager.copilot_models.write().await.extend([
+            (
+                "account_a".to_string(),
+                vec![model_visible.clone(), model_hidden.clone()],
+            ),
+            ("account_b".to_string(), vec![model_account_b.clone()]),
+        ]);
+
+        // 1. 默认账号 API 必须返回完整目录，包括 picker=false 的隐藏模型
+        let default_models = manager.fetch_models().await.unwrap();
+        assert_eq!(default_models.len(), 2);
+        assert!(default_models
+            .iter()
+            .any(|m| m.id == "gpt-5.4" && m.model_picker_enabled));
+        let hidden_fetched = default_models
+            .iter()
+            .find(|m| m.id == "gpt-5.6-luna")
+            .expect("gpt-5.6-luna must be present despite model_picker_enabled=false");
+        assert!(!hidden_fetched.model_picker_enabled);
+        assert_eq!(hidden_fetched.context_window, Some(922_000));
+        assert_eq!(
+            hidden_fetched.supported_endpoints,
+            vec!["/responses", "ws:/responses"]
+        );
+        assert_eq!(hidden_fetched.supports_parallel_tool_calls, Some(true));
+        assert_eq!(
+            hidden_fetched.reasoning_effort,
+            Some(vec![
+                CopilotReasoningEffort::None,
+                CopilotReasoningEffort::Low,
+                CopilotReasoningEffort::Medium,
+            ])
+        );
+
+        // 2. 显式账号 API 必须返回对应账号的完整目录并保持账户隔离
+        let account_b_models = manager.fetch_models_for_account("account_b").await.unwrap();
+        assert_eq!(account_b_models.len(), 1);
+        assert_eq!(account_b_models[0].id, "kimi-k3");
+        assert!(!account_b_models[0].model_picker_enabled);
+    }
+
+    #[test]
+    fn test_copilot_models_response_item_defaults_missing_picker_flag() {
+        let json_with_missing_picker = r#"{
+            "data": [
+                {
+                    "id": "test-model-1",
+                    "name": "Test Model 1",
+                    "vendor": "Test Vendor",
+                    "supported_endpoints": ["/chat/completions"]
+                }
+            ]
+        }"#;
+
+        let parsed: CopilotModelsResponse = serde_json::from_str(json_with_missing_picker).unwrap();
+        assert_eq!(parsed.data.len(), 1);
+        assert_eq!(parsed.data[0].id, "test-model-1");
+        assert!(!parsed.data[0].model_picker_enabled);
     }
 
     #[tokio::test]
