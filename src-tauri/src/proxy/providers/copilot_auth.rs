@@ -957,6 +957,47 @@ impl CopilotAuthManager {
         }
     }
 
+    /// 失效指定账号已缓存的 Copilot Bearer Token（如遇到上游 401，促使下次调用重新向 GitHub 换票）
+    pub async fn invalidate_token_for_account(&self, account_id: &str) {
+        let mut tokens = self.copilot_tokens.write().await;
+        if tokens.remove(account_id).is_some() {
+            log::info!("[CopilotAuth] 已失效账号 {account_id} 的 Copilot Bearer Token 缓存");
+        }
+    }
+
+    /// 仅当指定账号当前缓存的 Copilot Bearer Token 与 expected_token 匹配时才失效缓存。
+    /// 防止并发请求 A 刷新出新 Bearer 后，B 的旧请求迟到返回 401 误删新凭证。
+    pub async fn invalidate_token_if_matches(
+        &self,
+        account_id: &str,
+        expected_token: &str,
+    ) -> bool {
+        let mut tokens = self.copilot_tokens.write().await;
+        if let Some(cached) = tokens.get(account_id) {
+            if cached.token == expected_token {
+                tokens.remove(account_id);
+                let preview_len = expected_token.len().min(8);
+                log::info!(
+                    "[CopilotAuth] 已失效账号 {account_id} 匹配版本 ({}) 的 Copilot Bearer Token 缓存",
+                    &expected_token[..preview_len]
+                );
+                return true;
+            } else {
+                log::info!(
+                    "[CopilotAuth] 保留账号 {account_id} 较新的 Copilot Bearer Token（与 401 失败令牌版本不一致）"
+                );
+            }
+        }
+        false
+    }
+
+    /// 失效默认账号的 Copilot Bearer Token 缓存
+    pub async fn invalidate_default_token(&self) {
+        if let Some(id) = self.resolve_default_account_id().await {
+            self.invalidate_token_for_account(&id).await;
+        }
+    }
+
     // ==================== 模型和使用量 ====================
 
     /// 获取指定账号的 Copilot 可用模型列表（返回完整目录，不再受 model_picker_enabled 客户端过滤限制）
@@ -2759,5 +2800,52 @@ mod tests {
 
         let account = GitHubAccount::from(&data);
         assert_eq!(account.id, "company.ghe.com:99999");
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_token_if_matches() {
+        let temp_dir = tempdir().unwrap();
+        let manager = CopilotAuthManager::new(temp_dir.path().to_path_buf());
+
+        // 插入 token-v2
+        {
+            let mut tokens = manager.copilot_tokens.write().await;
+            tokens.insert(
+                "acc-1".to_string(),
+                CopilotToken {
+                    token: "bearer-token-v2".to_string(),
+                    expires_at: 1800000000,
+                },
+            );
+        }
+
+        // 旧的 401 请求携带 bearer-token-v1，尝试失效 -> 不应删除 v2
+        let removed = manager
+            .invalidate_token_if_matches("acc-1", "bearer-token-v1")
+            .await;
+        assert!(!removed);
+        {
+            let tokens = manager.copilot_tokens.read().await;
+            assert_eq!(
+                tokens.get("acc-1").map(|t| t.token.as_str()),
+                Some("bearer-token-v2")
+            );
+        }
+
+        // 别的账号尝试失效 -> 不影响 acc-1
+        let removed = manager
+            .invalidate_token_if_matches("acc-2", "bearer-token-v2")
+            .await;
+        assert!(!removed);
+
+        // 匹配当前 token-v2 -> 成功失效
+        let removed = manager
+            .invalidate_token_if_matches("acc-1", "bearer-token-v2")
+            .await;
+        assert!(removed);
+        {
+            let tokens = manager.copilot_tokens.read().await;
+            assert!(tokens.get("acc-1").is_none());
+        }
     }
 }
