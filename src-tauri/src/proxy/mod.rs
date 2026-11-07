@@ -9,6 +9,7 @@ pub mod circuit_breaker;
 mod classifier_guard;
 pub(crate) mod codex_quota_protection;
 pub(crate) mod content_encoding;
+pub mod copilot_fusion_session;
 pub mod copilot_optimizer;
 pub mod error;
 pub mod error_mapper;

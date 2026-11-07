@@ -392,6 +392,8 @@ pub struct RequestForwarder {
     /// 最近一次 `forward()` 定下的出站模型名，失败时随 [`ForwardError`] 交给日志。
     /// 每次 `forward()` 开头清空，映射失败等没走到出站的尝试留 None（日志回落到请求名）。
     last_outbound_model: std::sync::Mutex<Option<String>>,
+    pub(crate) copilot_fusion_sessions:
+        Option<Arc<super::copilot_fusion_session::FusionSessionManager>>,
 }
 
 impl RequestForwarder {
@@ -527,6 +529,7 @@ impl RequestForwarder {
             stack_request: false,
             failover_chain: false,
             last_outbound_model: std::sync::Mutex::new(None),
+            copilot_fusion_sessions: None,
         }
     }
 
@@ -561,6 +564,14 @@ impl RequestForwarder {
         self.failover_chain
             && matches!(app_type, AppType::Codex)
             && CodexStandaloneEndpoint::from_effective_endpoint(endpoint).is_none()
+    }
+
+    pub fn copilot_fusion_sessions(
+        mut self,
+        sessions: Arc<super::copilot_fusion_session::FusionSessionManager>,
+    ) -> Self {
+        self.copilot_fusion_sessions = Some(sessions);
+        self
     }
 
     /// 这个请求读写路由状态吗：熔断器（许可、结果、健康度）、「正在使用」、代理统计
@@ -4986,6 +4997,7 @@ mod tests {
             stack_request: false,
             failover_chain: false,
             last_outbound_model: std::sync::Mutex::new(None),
+            copilot_fusion_sessions: None,
         }
     }
 
