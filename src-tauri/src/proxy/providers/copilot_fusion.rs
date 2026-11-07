@@ -62,7 +62,7 @@ fn default_true() -> bool {
 }
 
 /// Server multi_turn configuration returned by /auto
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct CopilotAutoMultiTurnConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -73,7 +73,7 @@ pub struct CopilotAutoMultiTurnConfig {
     #[serde(default)]
     pub escalate_threshold: Option<u32>,
     #[serde(default)]
-    pub backoff_coefficient: Option<u32>,
+    pub backoff_coefficient: Option<f64>,
     #[serde(default)]
     pub context_window: Option<u32>,
     #[serde(flatten)]
@@ -153,7 +153,7 @@ impl ParsedSessionToken {
         if parts.len() < 2 {
             return None;
         }
-        let payload_b64 = parts[1];
+        let payload_b64 = parts[1].trim_end_matches('=');
         let payload_bytes = URL_SAFE_NO_PAD
             .decode(payload_b64)
             .or_else(|_| {
@@ -163,7 +163,9 @@ impl ParsedSessionToken {
             .ok()?;
 
         let json_val: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-        let exp = json_val.get("exp").and_then(|v| v.as_u64());
+        let exp = json_val
+            .get("exp")
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)));
         let auto_session_id = json_val
             .get("auto_session_id")
             .and_then(|v| v.as_str())
@@ -186,37 +188,56 @@ impl ParsedSessionToken {
     }
 }
 
+fn append_prompt_part(prompt: &mut String, text: &str) {
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        if !prompt.is_empty() {
+            prompt.push('\n');
+        }
+        prompt.push_str(trimmed);
+    }
+}
+
+fn truncate_to_char_boundary(s: &mut String, max_bytes: usize) {
+    if s.len() > max_bytes {
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+}
+
 /// Extract prompt text and image presence across Anthropic Messages, Codex Responses,
-/// and Chat Completions protocols. Safely bounded to 4000 chars.
+/// and Chat Completions protocols. Safely bounded to 4000 bytes on valid UTF-8 boundaries.
 pub fn extract_prompt_summary_for_fusion(
     request_body: &serde_json::Value,
     protocol: RequestProtocol,
 ) -> (String, bool) {
+    let mut prompt = String::new();
+    let mut has_image = false;
+
     match protocol {
         RequestProtocol::AnthropicMessages => {
-            let mut prompt = String::new();
-            let mut has_image = false;
             if let Some(messages) = request_body.get("messages").and_then(|v| v.as_array()) {
                 for msg in messages {
                     let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                    if let Some(content) = msg.get("content") {
-                        if let Some(text) = content.as_str() {
-                            if role == "user" {
-                                prompt = text.to_string();
-                            }
-                        } else if let Some(parts) = content.as_array() {
-                            for part in parts {
-                                let part_type =
-                                    part.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                if part_type == "image" {
-                                    has_image = true;
-                                }
-                                if role == "user" && part_type == "text" {
-                                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                        if !prompt.is_empty() {
-                                            prompt.push('\n');
+                    if role == "user" {
+                        if let Some(content) = msg.get("content") {
+                            if let Some(text) = content.as_str() {
+                                append_prompt_part(&mut prompt, text);
+                            } else if let Some(parts) = content.as_array() {
+                                for part in parts {
+                                    let part_type =
+                                        part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                    if part_type == "image" {
+                                        has_image = true;
+                                    } else if part_type == "text" {
+                                        if let Some(text) =
+                                            part.get("text").and_then(|v| v.as_str())
+                                        {
+                                            append_prompt_part(&mut prompt, text);
                                         }
-                                        prompt.push_str(text);
                                     }
                                 }
                             }
@@ -224,35 +245,50 @@ pub fn extract_prompt_summary_for_fusion(
                     }
                 }
             }
-            if prompt.is_empty() {
-                prompt = "Assist with coding task".to_string();
-            }
-            if prompt.len() > 4000 {
-                prompt.truncate(4000);
-            }
-            (prompt, has_image)
         }
         RequestProtocol::CodexResponses => {
-            let mut prompt = String::new();
-            let mut has_image = false;
-            if let Some(input) = request_body.get("input").and_then(|v| v.as_array()) {
-                for item in input {
-                    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if item_type == "message" {
-                        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                        if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
-                            for part in content {
-                                let part_type =
-                                    part.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                if part_type == "input_image" {
-                                    has_image = true;
-                                }
-                                if role == "user" && part_type == "input_text" {
-                                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                        if !prompt.is_empty() {
-                                            prompt.push('\n');
+            if let Some(input_val) = request_body.get("input") {
+                if let Some(text) = input_val.as_str() {
+                    append_prompt_part(&mut prompt, text);
+                } else if let Some(input) = input_val.as_array() {
+                    for item in input {
+                        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if item_type == "input_text" || item_type == "text" {
+                            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                append_prompt_part(&mut prompt, text);
+                            }
+                        } else if item_type == "input_image"
+                            || item_type == "image_url"
+                            || item_type == "image"
+                        {
+                            has_image = true;
+                        } else {
+                            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                            if role == "user" || (role.is_empty() && item_type == "message") {
+                                if let Some(content) = item.get("content") {
+                                    if let Some(text) = content.as_str() {
+                                        append_prompt_part(&mut prompt, text);
+                                    } else if let Some(parts) = content.as_array() {
+                                        for part in parts {
+                                            let part_type = part
+                                                .get("type")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            if part_type == "input_image"
+                                                || part_type == "image_url"
+                                                || part_type == "image"
+                                            {
+                                                has_image = true;
+                                            } else if part_type == "input_text"
+                                                || part_type == "text"
+                                            {
+                                                if let Some(text) =
+                                                    part.get("text").and_then(|v| v.as_str())
+                                                {
+                                                    append_prompt_part(&mut prompt, text);
+                                                }
+                                            }
                                         }
-                                        prompt.push_str(text);
                                     }
                                 }
                             }
@@ -260,38 +296,27 @@ pub fn extract_prompt_summary_for_fusion(
                     }
                 }
             }
-            if prompt.is_empty() {
-                prompt = "Assist with coding task".to_string();
-            }
-            if prompt.len() > 4000 {
-                prompt.truncate(4000);
-            }
-            (prompt, has_image)
         }
         RequestProtocol::ChatCompletions => {
-            let mut prompt = String::new();
-            let mut has_image = false;
             if let Some(messages) = request_body.get("messages").and_then(|v| v.as_array()) {
                 for msg in messages {
                     let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                    if let Some(content) = msg.get("content") {
-                        if let Some(text) = content.as_str() {
-                            if role == "user" {
-                                prompt = text.to_string();
-                            }
-                        } else if let Some(parts) = content.as_array() {
-                            for part in parts {
-                                let part_type =
-                                    part.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                if part_type == "image_url" {
-                                    has_image = true;
-                                }
-                                if role == "user" && part_type == "text" {
-                                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                        if !prompt.is_empty() {
-                                            prompt.push('\n');
+                    if role == "user" {
+                        if let Some(content) = msg.get("content") {
+                            if let Some(text) = content.as_str() {
+                                append_prompt_part(&mut prompt, text);
+                            } else if let Some(parts) = content.as_array() {
+                                for part in parts {
+                                    let part_type =
+                                        part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                    if part_type == "image_url" {
+                                        has_image = true;
+                                    } else if part_type == "text" {
+                                        if let Some(text) =
+                                            part.get("text").and_then(|v| v.as_str())
+                                        {
+                                            append_prompt_part(&mut prompt, text);
                                         }
-                                        prompt.push_str(text);
                                     }
                                 }
                             }
@@ -299,15 +324,14 @@ pub fn extract_prompt_summary_for_fusion(
                     }
                 }
             }
-            if prompt.is_empty() {
-                prompt = "Assist with coding task".to_string();
-            }
-            if prompt.len() > 4000 {
-                prompt.truncate(4000);
-            }
-            (prompt, has_image)
         }
     }
+
+    if prompt.is_empty() {
+        prompt = "Assist with coding task".to_string();
+    }
+    truncate_to_char_boundary(&mut prompt, 4000);
+    (prompt, has_image)
 }
 
 /// Client for calling POST /auto
@@ -350,6 +374,7 @@ impl CopilotFusionClient {
             .header("X-Github-Api-Version", COPILOT_FUSION_API_VERSION)
             .header("X-Initiator", "user")
             .header("X-Interaction-Id", interaction_id)
+            .timeout(std::time::Duration::from_secs(15))
             .json(&request_body)
             .send()
             .await
@@ -380,12 +405,12 @@ impl CopilotFusionClient {
             ProxyError::TransformError(format!("Failed to parse Copilot /auto response JSON: {e}"))
         })?;
 
-        if parsed.session_token.is_empty() {
+        if parsed.session_token.trim().is_empty() {
             return Err(ProxyError::TransformError(
                 "Copilot /auto response missing session_token".to_string(),
             ));
         }
-        if parsed.selected_model.model_id().is_empty() {
+        if parsed.selected_model.model_id().trim().is_empty() {
             return Err(ProxyError::TransformError(
                 "Copilot /auto response missing selected_model ID".to_string(),
             ));
@@ -518,5 +543,143 @@ mod tests {
             extract_prompt_summary_for_fusion(&req, RequestProtocol::ChatCompletions);
         assert_eq!(prompt, "Explain this diagram");
         assert!(has_image);
+    }
+
+    #[test]
+    fn test_utf8_cjk_truncation_does_not_panic() {
+        // Chinese character '中' is 3 bytes (0xE4 0xB8 0xAD).
+        // 1334 * 3 = 4002 bytes. At 4000 bytes, it cuts in the middle of a character.
+        let large_cjk = "中".repeat(1500);
+        let req = json!({
+            "messages": [
+                {"role": "user", "content": large_cjk}
+            ]
+        });
+        let (prompt, _) =
+            extract_prompt_summary_for_fusion(&req, RequestProtocol::AnthropicMessages);
+        assert!(prompt.len() <= 4000);
+        // Valid UTF-8 check
+        assert!(std::str::from_utf8(prompt.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parsed_session_token_with_base64_padding() {
+        let payload = json!({
+            "exp": 1794116452,
+            "auto_session_id": "session-xyz",
+            "auto_tier": "balance",
+            "execution_mode": "fusion"
+        });
+        let payload_str = serde_json::to_string(&payload).unwrap();
+        // Force base64 with '=' padding
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        let b64_padded = STANDARD.encode(payload_str.as_bytes());
+        assert!(b64_padded.contains('='));
+
+        let token = format!("eyJhbGciOiJFUzI1NiJ9.{b64_padded}.sig");
+        let parsed = ParsedSessionToken::parse(&token).unwrap();
+        assert_eq!(parsed.exp, Some(1794116452));
+    }
+
+    #[test]
+    fn test_deserialize_auto_response_with_float_backoff() {
+        let fixture = json!({
+            "session_token": "token123",
+            "selected_model": "gpt-5.6-luna",
+            "multi_turn": {
+                "enabled": true,
+                "backoff_coefficient": 2.5
+            }
+        });
+        let resp: CopilotAutoResponse = serde_json::from_value(fixture).unwrap();
+        let mt = resp.multi_turn.unwrap();
+        assert_eq!(mt.backoff_coefficient, Some(2.5));
+    }
+
+    #[test]
+    fn test_extract_prompt_summary_responses_plain_string() {
+        let req = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "A direct string content without array"
+                }
+            ]
+        });
+        let (prompt, _) = extract_prompt_summary_for_fusion(&req, RequestProtocol::CodexResponses);
+        assert_eq!(prompt, "A direct string content without array");
+    }
+
+    #[test]
+    fn test_extract_prompt_summary_responses_top_level_string_input() {
+        let req = json!({
+            "input": "Direct top-level input string"
+        });
+        let (prompt, has_image) =
+            extract_prompt_summary_for_fusion(&req, RequestProtocol::CodexResponses);
+        assert_eq!(prompt, "Direct top-level input string");
+        assert!(!has_image);
+    }
+
+    #[test]
+    fn test_extract_prompt_summary_responses_top_level_items() {
+        let req = json!({
+            "input": [
+                {"type": "input_text", "text": "Top level item"},
+                {"type": "input_image", "image_url": "https://example.com/test.png"}
+            ]
+        });
+        let (prompt, has_image) =
+            extract_prompt_summary_for_fusion(&req, RequestProtocol::CodexResponses);
+        assert_eq!(prompt, "Top level item");
+        assert!(has_image);
+    }
+
+    #[test]
+    fn test_extract_prompt_summary_responses_standard_untyped_user_message() {
+        let req = json!({
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Standard Responses text"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
+                    ]
+                }
+            ]
+        });
+        let (prompt, has_image) =
+            extract_prompt_summary_for_fusion(&req, RequestProtocol::CodexResponses);
+        assert_eq!(prompt, "Standard Responses text");
+        assert!(has_image);
+    }
+
+    #[test]
+    fn test_parsed_session_token_with_float_exp() {
+        let payload = json!({
+            "exp": 1794116452.5,
+            "auto_session_id": "session-xyz"
+        });
+        let payload_str = serde_json::to_string(&payload).unwrap();
+        let b64 = URL_SAFE_NO_PAD.encode(payload_str.as_bytes());
+        let token = format!("eyJhbGciOiJFUzI1NiJ9.{b64}.sig");
+        let parsed = ParsedSessionToken::parse(&token).unwrap();
+        assert_eq!(parsed.exp, Some(1794116452));
+    }
+
+    #[test]
+    fn test_extract_prompt_summary_multi_turn_aggregation() {
+        let req = json!({
+            "messages": [
+                {"role": "user", "content": "First question"},
+                {"role": "assistant", "content": "First answer"},
+                {"role": "user", "content": [{"type": "text", "text": "Follow up question"}]}
+            ]
+        });
+        let (prompt, _) =
+            extract_prompt_summary_for_fusion(&req, RequestProtocol::AnthropicMessages);
+        assert_eq!(prompt, "First question\nFollow up question");
     }
 }
