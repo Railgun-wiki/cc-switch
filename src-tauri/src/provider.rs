@@ -80,6 +80,15 @@ impl Provider {
             || self.claude_base_url_contains("githubcopilot.com")
     }
 
+    pub fn is_copilot_fusion(&self) -> bool {
+        self.is_github_copilot()
+            && self
+                .meta
+                .as_ref()
+                .map(|m| m.is_copilot_fusion())
+                .unwrap_or(false)
+    }
+
     pub fn uses_managed_account_auth(&self) -> bool {
         self.is_github_copilot()
             || self.is_codex_oauth()
@@ -545,6 +554,12 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub codex_copilot_api_format: Option<String>,
+    /// Copilot model selection: "fixed" | "fusion"
+    #[serde(
+        rename = "copilotModelSelection",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub copilot_model_selection: Option<String>,
     /// 通用认证绑定（provider_config / managed_account）
     ///
     /// 新代码应只写入该字段；githubAccountId 仅保留兼容读取。
@@ -677,6 +692,14 @@ pub fn parse_custom_user_agent(
 }
 
 impl ProviderMeta {
+    /// 是否启用 Copilot 智能自适应模型模式（Fusion Auto）
+    pub fn is_copilot_fusion(&self) -> bool {
+        self.copilot_model_selection
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("fusion"))
+            .unwrap_or(false)
+    }
+
     /// Codex OAuth FAST mode 是否启用。默认关闭，因为 `service_tier="priority"`
     /// 会按更高速率消耗 ChatGPT 订阅配额，用户需显式开启以换取更低延迟。
     pub fn codex_fast_mode_enabled(&self) -> bool {

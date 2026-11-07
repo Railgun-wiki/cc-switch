@@ -1427,7 +1427,7 @@ impl CopilotAuthManager {
         account_list
     }
 
-    async fn resolve_default_account_id(&self) -> Option<String> {
+    pub async fn resolve_default_account_id(&self) -> Option<String> {
         let stored_default = self.default_account_id.read().await.clone();
         let accounts = self.accounts.read().await;
 

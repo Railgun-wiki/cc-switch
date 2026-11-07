@@ -28,6 +28,7 @@ pub const COPILOT_FUSION_VIRTUAL_MODEL_ID: &str = "copilot-fusion-auto";
 pub enum RequestProtocol {
     AnthropicMessages,
     CodexResponses,
+    #[allow(dead_code)]
     ChatCompletions,
 }
 
@@ -62,7 +63,7 @@ fn default_true() -> bool {
 }
 
 /// Server multi_turn configuration returned by /auto
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct CopilotAutoMultiTurnConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -140,6 +141,7 @@ impl std::fmt::Debug for CopilotAutoResponse {
 
 /// JWT payload decoded from session_token
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ParsedSessionToken {
     pub exp: Option<u64>,
     pub auto_session_id: Option<String>,
@@ -385,16 +387,6 @@ impl CopilotFusionClient {
         let status = response.status();
         if !status.is_success() {
             let err_body = response.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                return Err(ProxyError::AuthError(format!(
-                    "Copilot /auto returned 401 Unauthorized: {err_body}"
-                )));
-            }
-            if status == reqwest::StatusCode::FORBIDDEN {
-                return Err(ProxyError::AuthError(format!(
-                    "Copilot /auto returned 403 Forbidden: {err_body}"
-                )));
-            }
             return Err(ProxyError::UpstreamError {
                 status: status.as_u16(),
                 body: Some(err_body),

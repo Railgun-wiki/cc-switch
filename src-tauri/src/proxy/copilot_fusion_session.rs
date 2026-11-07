@@ -101,6 +101,11 @@ impl FusionSessionManager {
             if !record.snapshot.is_valid() {
                 return None;
             }
+            if let Some(ref mt) = record.snapshot.multi_turn {
+                if !mt.enabled && record.turns_count > 0 {
+                    return None;
+                }
+            }
             record.last_accessed = now;
             return Some(record.snapshot.clone());
         }
@@ -162,10 +167,12 @@ impl FusionSessionManager {
         }
         .await;
 
-        // Clean up lock from single_flight map if no other callers are waiting
+        // Clean up lock from single_flight map if no other callers are waiting and it wasn't replaced
         {
             let mut locks = self.single_flight.lock().await;
-            if Arc::strong_count(&gate) <= 2 {
+            if Arc::strong_count(&gate) <= 2
+                && locks.get(key).is_some_and(|l| Arc::ptr_eq(l, &gate))
+            {
                 locks.remove(key);
             }
         }
