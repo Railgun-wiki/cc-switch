@@ -1912,7 +1912,12 @@
     "deploymentType": "GitHub Deployment Type",
     "deploymentGitHubCom": "GitHub.com",
     "deploymentEnterprise": "GitHub Enterprise Server",
-    "enterpriseDomainPlaceholder": "e.g. company.ghe.com"
+    "enterpriseDomainPlaceholder": "e.g. company.ghe.com",
+    "modelSelection": "Model Selection",
+    "modelSelectionFixed": "Fixed Model",
+    "modelSelectionFusion": "Fusion Auto (Adaptive)",
+    "modelSelectionFusionHint": "Reuse auto-selected model across turns within the session",
+    "modelSelectionFusionActiveNotice": "Fusion Auto is currently enabled. The model for each session is dynamically resolved on the first turn and reused across subsequent turns."
   },
   "codexOauth": {
     "authStatus": "Auth status",

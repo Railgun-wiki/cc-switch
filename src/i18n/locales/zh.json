@@ -1912,7 +1912,12 @@
     "deploymentType": "GitHub 部署类型",
     "deploymentGitHubCom": "GitHub.com",
     "deploymentEnterprise": "GitHub Enterprise Server",
-    "enterpriseDomainPlaceholder": "例如：company.ghe.com"
+    "enterpriseDomainPlaceholder": "例如：company.ghe.com",
+    "modelSelection": "模型选择策略",
+    "modelSelectionFixed": "固定模型",
+    "modelSelectionFusion": "智能自适应 (Fusion Auto)",
+    "modelSelectionFusionHint": "会话内复用自动选模结果",
+    "modelSelectionFusionActiveNotice": "当前已启用智能自适应选模，每次会话首轮由 Copilot /auto 动态决议最合适的模型，并在会话内自动复用。"
   },
   "codexOauth": {
     "authStatus": "认证状态",

@@ -1324,7 +1324,18 @@ fn codex_catalog_model_entry(
         return json!({});
     };
 
-    let display_name = spec.display_name.as_deref().unwrap_or(&spec.model);
+    let display_name = match spec.display_name.as_deref() {
+        Some(name) => name,
+        None => {
+            if spec.model
+                == crate::proxy::providers::copilot_fusion::COPILOT_FUSION_VIRTUAL_MODEL_ID
+            {
+                "Copilot Fusion (Auto)"
+            } else {
+                &spec.model
+            }
+        }
+    };
     let context_window = spec.context_window.unwrap_or(default_context_window);
     entry_obj.insert("slug".to_string(), json!(spec.model));
     // Explicitly configured models must be listed even when the cached template is hidden.
@@ -2175,7 +2186,22 @@ fn codex_model_catalog_from_settings(
     config_text: &str,
     profile: CodexCatalogToolProfile,
 ) -> Result<Option<Value>, AppError> {
-    let specs = codex_catalog_model_specs(settings);
+    let mut specs = codex_catalog_model_specs(settings);
+    let top_model = codex_top_level_model(config_text);
+    if let Some(ref model) = top_model {
+        if model == crate::proxy::providers::copilot_fusion::COPILOT_FUSION_VIRTUAL_MODEL_ID {
+            if !specs.iter().any(|s| s.model == *model) {
+                specs.insert(
+                    0,
+                    CodexCatalogModelSpec {
+                        model: model.clone(),
+                        display_name: Some("Copilot Fusion (Auto)".to_string()),
+                        ..CodexCatalogModelSpec::default()
+                    },
+                );
+            }
+        }
+    }
     if specs.is_empty() {
         return Ok(None);
     }
@@ -4927,6 +4953,38 @@ wire_api = "responses"
                 assert!(entry.get(*key).is_some(), "{key} is required by Codex");
             }
         }
+    }
+
+    #[test]
+    fn copilot_fusion_auto_injected_into_catalog_when_top_level_model() {
+        let config = "model = \"copilot-fusion-auto\"\n";
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    { "model": "gpt-5.5" }
+                ]
+            }
+        });
+        let catalog =
+            codex_model_catalog_from_settings(&settings, config, CodexCatalogToolProfile::Copilot)
+                .unwrap()
+                .expect("catalog should be generated");
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models[0]["slug"], "copilot-fusion-auto");
+        assert_eq!(models[0]["display_name"], "Copilot Fusion (Auto)");
+        assert_eq!(models[1]["slug"], "gpt-5.5");
+
+        let empty_settings = json!({});
+        let catalog_empty = codex_model_catalog_from_settings(
+            &empty_settings,
+            config,
+            CodexCatalogToolProfile::Copilot,
+        )
+        .unwrap()
+        .expect("catalog should be generated for virtual model");
+        let models_empty = catalog_empty["models"].as_array().unwrap();
+        assert_eq!(models_empty.len(), 1);
+        assert_eq!(models_empty[0]["slug"], "copilot-fusion-auto");
     }
 
     #[test]

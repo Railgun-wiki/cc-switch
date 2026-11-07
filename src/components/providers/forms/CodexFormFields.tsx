@@ -220,6 +220,8 @@ interface CodexFormFieldsProps {
   onApiFormatChange: (format: CodexApiFormat) => void;
   copilotApiFormat?: CodexCopilotApiFormat;
   onCopilotApiFormatChange?: (format: CodexCopilotApiFormat) => void;
+  copilotModelSelection?: "fixed" | "fusion";
+  onCopilotModelSelectionChange?: (selection: "fixed" | "fusion") => void;
   // Auth field for the Anthropic Messages upstream (only used when apiFormat === "anthropic")
   anthropicAuthField: ClaudeApiKeyField;
   onAnthropicAuthFieldChange: (value: ClaudeApiKeyField) => void;
@@ -688,6 +690,8 @@ export function CodexFormFields({
   onApiFormatChange,
   copilotApiFormat = "auto",
   onCopilotApiFormatChange,
+  copilotModelSelection = "fixed",
+  onCopilotModelSelectionChange,
   anthropicAuthField,
   onAnthropicAuthFieldChange,
   impersonateClaudeCode,
@@ -1508,6 +1512,52 @@ export function CodexFormFields({
     </div>
   );
 
+  const copilotModelSelectionSelect = isCopilotPreset && (
+    <div className="space-y-1.5">
+      {labelWithHelp(
+        t("copilot.modelSelection", { defaultValue: "模型选择策略" }),
+        t("copilot.modelSelectionFusionHint", {
+          defaultValue: "会话内复用自动选模结果",
+        }),
+        "copilot-model-selection",
+      )}
+      <Select
+        value={copilotModelSelection}
+        onValueChange={(value: "fixed" | "fusion") => {
+          onCopilotModelSelectionChange?.(value);
+        }}
+      >
+        <SelectTrigger
+          id="copilot-model-selection"
+          aria-label={t("copilot.modelSelection", {
+            defaultValue: "模型选择策略",
+          })}
+          className="w-full"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="fixed">
+            {t("copilot.modelSelectionFixed", { defaultValue: "固定模型" })}
+          </SelectItem>
+          <SelectItem value="fusion">
+            {t("copilot.modelSelectionFusion", {
+              defaultValue: "智能自适应 (Fusion Auto)",
+            })}
+          </SelectItem>
+        </SelectContent>
+      </Select>
+      {copilotModelSelection === "fusion" && (
+        <p className="text-xs leading-relaxed text-fg-2">
+          {t("copilot.modelSelectionFusionActiveNotice", {
+            defaultValue:
+              "当前已启用智能自适应选模，每次会话首轮由 Copilot /auto 动态决议最合适的模型，并在会话内自动复用。",
+          })}
+        </p>
+      )}
+    </div>
+  );
+
   const anthropicAuthFieldSelect = (
     <div className="space-y-1.5">
       {labelWithHelp(
@@ -2131,12 +2181,13 @@ export function CodexFormFields({
     return (
       <>
         {oauthSections}
-        {showFormatFields && upstreamFormatSelect}
+        {copilotModelSelectionSelect}
+        {showFormatFields && !(isCopilotPreset && copilotModelSelection === "fusion") && upstreamFormatSelect}
         {apiKeySection}
         {showFormatFields && isAnthropicFormat && anthropicAuthFieldSelect}
         {endpointSection}
 
-        {canEditCatalog && (
+        {canEditCatalog && !(isCopilotPreset && copilotModelSelection === "fusion") && (
           <div className="space-y-3">
             <div className="space-y-1">
               <div className="flex items-center justify-between gap-3">
@@ -2182,7 +2233,7 @@ export function CodexFormFields({
             )}
           </div>
         )}
-        {defaultModelField}
+        {!(isCopilotPreset && copilotModelSelection === "fusion") && defaultModelField}
 
         {hasStackAdvancedContent && (
           <Collapsible
@@ -2257,10 +2308,11 @@ export function CodexFormFields({
       {oauthSections}
       {apiKeySection}
       {endpointSection}
+      {copilotModelSelectionSelect}
 
       {/* 模型列表 —— 生成 Codex 的模型目录（model_catalog_json）：/model 菜单列哪些模型，
           各自的窗口和思考等级。留空不生成。第一行是默认模型，子代理也从这里选。 */}
-      {firstRowIsDefault && (
+      {firstRowIsDefault && !(isCopilotPreset && copilotModelSelection === "fusion") && (
         <div className="space-y-3">
           <div className="space-y-1">
             <div className="flex items-center justify-between gap-3">
@@ -2301,7 +2353,7 @@ export function CodexFormFields({
       )}
 
       {/* 默认模型：列表为空（或没有列表）时才显示 */}
-      {defaultModelField}
+      {!(isCopilotPreset && copilotModelSelection === "fusion") && defaultModelField}
 
       {/* 子代理 —— config.toml 的 [agents] default_subagent_model / default_subagent_reasoning_effort。
           留空删键，子代理跟随主模型；聚合模式下不写进 live（改用聚合设置）。 */}
@@ -2492,7 +2544,9 @@ export function CodexFormFields({
           <CollapsibleContent className="space-y-3 pt-3">
             {/* Copilot supports automatic capability routing or an explicit protocol;
                 other providers retain their existing format controls. */}
-            {(shouldShowSpeedTest || isCopilotPreset) && !isXaiOauthPreset && (
+            {(shouldShowSpeedTest || isCopilotPreset) &&
+              !isXaiOauthPreset &&
+              !(isCopilotPreset && copilotModelSelection === "fusion") && (
               <div className="space-y-3">
                 {upstreamFormatSelect}
                 {officialSpeedTiersToggle}

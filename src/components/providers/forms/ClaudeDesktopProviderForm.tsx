@@ -296,6 +296,9 @@ export function ClaudeDesktopProviderForm({
   const [codexFastMode, setCodexFastMode] = useState<boolean>(
     () => initialData?.meta?.codexFastMode ?? false,
   );
+  const [copilotModelSelection, setCopilotModelSelection] = useState<
+    "fixed" | "fusion"
+  >(initialData?.meta?.copilotModelSelection === "fusion" ? "fusion" : "fixed");
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(
     "custom",
   );
@@ -450,6 +453,7 @@ export function ClaudeDesktopProviderForm({
     setApiKeyField(preset.apiKeyField ?? "ANTHROPIC_AUTH_TOKEN");
     setApiFormat(preset.apiFormat ?? "anthropic");
     setReasoningEffort("auto");
+    setCopilotModelSelection("fixed");
 
     const presetMode =
       preset.requiresOAuth === true || isOAuthProviderType(preset.providerType)
@@ -732,6 +736,7 @@ export function ClaudeDesktopProviderForm({
       delete meta.claudeReasoningEffort;
       delete meta.endpointAutoSelect;
       delete meta.isFullUrl;
+      delete meta.copilotModelSelection;
       await onSubmit({
         ...values,
         name: values.name.trim(),
@@ -932,6 +937,10 @@ export function ClaudeDesktopProviderForm({
           : effectiveMode === "proxy"
             ? savedApiFormat
             : "anthropic",
+      copilotModelSelection:
+        usesAutomaticCopilotFormat && copilotModelSelection === "fusion"
+          ? "fusion"
+          : undefined,
     };
 
     meta.claudeDesktopModelRoutes = routeMap;
@@ -1170,65 +1179,113 @@ export function ClaudeDesktopProviderForm({
 
               {needsModelMapping && (
                 <div className="space-y-4 border-t border-border pt-4">
-                  {activeProviderType !== "xai_oauth" && (
+                  {usesAutomaticCopilotFormat && (
                     <div className="space-y-2">
-                      <Label>
-                        {t("providerForm.apiFormat", {
-                          defaultValue: "上游格式",
+                      <Label htmlFor="copilot-desktop-model-selection">
+                        {t("copilot.modelSelection", {
+                          defaultValue: "模型选择策略",
                         })}
                       </Label>
                       <Select
-                        value={apiFormat}
-                        disabled={usesAutomaticCopilotFormat}
+                        value={copilotModelSelection}
                         onValueChange={(value) =>
-                          setApiFormat(value as ClaudeApiFormat)
+                          setCopilotModelSelection(value as "fixed" | "fusion")
                         }
                       >
-                        <SelectTrigger className="w-full">
-                          <SelectValue
-                            key={
-                              usesAutomaticCopilotFormat
-                                ? "automatic"
-                                : "manual"
-                            }
-                          >
-                            {usesAutomaticCopilotFormat
-                              ? t("copilot.automaticFormat")
-                              : undefined}
-                          </SelectValue>
+                        <SelectTrigger
+                          id="copilot-desktop-model-selection"
+                          aria-label={t("copilot.modelSelection", {
+                            defaultValue: "模型选择策略",
+                          })}
+                          className="w-full"
+                        >
+                          <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="anthropic">
-                            {t("providerForm.apiFormatAnthropic", {
-                              defaultValue: "Anthropic Messages (原生)",
+                          <SelectItem value="fixed">
+                            {t("copilot.modelSelectionFixed", {
+                              defaultValue: "固定模型",
                             })}
                           </SelectItem>
-                          <SelectItem value="openai_chat">
-                            {t("providerForm.apiFormatOpenAIChat", {
-                              defaultValue:
-                                "OpenAI Chat Completions (需开启路由)",
-                            })}
-                          </SelectItem>
-                          <SelectItem value="openai_responses">
-                            {t("providerForm.apiFormatOpenAIResponses", {
-                              defaultValue: "OpenAI Responses API (需开启路由)",
-                            })}
-                          </SelectItem>
-                          <SelectItem value="gemini_native">
-                            {t("providerForm.apiFormatGeminiNative", {
-                              defaultValue:
-                                "Gemini Native generateContent (需开启路由)",
+                          <SelectItem value="fusion">
+                            {t("copilot.modelSelectionFusion", {
+                              defaultValue: "智能自适应 (Fusion Auto)",
                             })}
                           </SelectItem>
                         </SelectContent>
                       </Select>
-                      {usesAutomaticCopilotFormat && (
-                        <p className="text-xs leading-relaxed text-fg-2">
-                          {t("copilot.automaticFormatHint")}
-                        </p>
-                      )}
+                      <p className="text-xs leading-relaxed text-fg-2">
+                        {t("copilot.modelSelectionFusionHint", {
+                          defaultValue: "会话内复用自动选模结果",
+                        })}
+                      </p>
                     </div>
                   )}
+
+                  {activeProviderType !== "xai_oauth" &&
+                    !(
+                      usesAutomaticCopilotFormat &&
+                      copilotModelSelection === "fusion"
+                    ) && (
+                      <div className="space-y-2">
+                        <Label>
+                          {t("providerForm.apiFormat", {
+                            defaultValue: "上游格式",
+                          })}
+                        </Label>
+                        <Select
+                          value={apiFormat}
+                          disabled={usesAutomaticCopilotFormat}
+                          onValueChange={(value) =>
+                            setApiFormat(value as ClaudeApiFormat)
+                          }
+                        >
+                          <SelectTrigger className="w-full">
+                            <SelectValue
+                              key={
+                                usesAutomaticCopilotFormat
+                                  ? "automatic"
+                                  : "manual"
+                              }
+                            >
+                              {usesAutomaticCopilotFormat
+                                ? t("copilot.automaticFormat")
+                                : undefined}
+                            </SelectValue>
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="anthropic">
+                              {t("providerForm.apiFormatAnthropic", {
+                                defaultValue: "Anthropic Messages (原生)",
+                              })}
+                            </SelectItem>
+                            <SelectItem value="openai_chat">
+                              {t("providerForm.apiFormatOpenAIChat", {
+                                defaultValue:
+                                  "OpenAI Chat Completions (需开启路由)",
+                              })}
+                            </SelectItem>
+                            <SelectItem value="openai_responses">
+                              {t("providerForm.apiFormatOpenAIResponses", {
+                                defaultValue:
+                                  "OpenAI Responses API (需开启路由)",
+                              })}
+                            </SelectItem>
+                            <SelectItem value="gemini_native">
+                              {t("providerForm.apiFormatGeminiNative", {
+                                defaultValue:
+                                  "Gemini Native generateContent (需开启路由)",
+                              })}
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                        {usesAutomaticCopilotFormat && (
+                          <p className="text-xs leading-relaxed text-fg-2">
+                            {t("copilot.automaticFormatHint")}
+                          </p>
+                        )}
+                      </div>
+                    )}
 
                   {!isOAuthProviderType(activeProviderType) &&
                     !usesAutomaticCopilotFormat &&
@@ -1241,8 +1298,17 @@ export function ClaudeDesktopProviderForm({
                       />
                     )}
 
-                  <div className="space-y-3">
-                    <div className="space-y-1 border-t border-border pt-4">
+                  {usesAutomaticCopilotFormat &&
+                  copilotModelSelection === "fusion" ? (
+                    <div className="rounded-md border border-border bg-bg-2 p-3 text-xs leading-relaxed text-fg-2">
+                      {t("copilot.modelSelectionFusionActiveNotice", {
+                        defaultValue:
+                          "当前已启用智能自适应选模，每次会话首轮由 Copilot /auto 动态决议最合适的模型，并在会话内自动复用。",
+                      })}
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <div className="space-y-1 border-t border-border pt-4">
                       <div className="flex items-center justify-between">
                         <Label>
                           {t("claudeDesktop.routeMapTitle", {
@@ -1376,8 +1442,9 @@ export function ClaudeDesktopProviderForm({
                       );
                     })}
                   </div>
-                </div>
-              )}
+                )}
+              </div>
+            )}
 
               {!needsModelMapping && (
                 <div className="space-y-3 border-t border-border pt-4">
