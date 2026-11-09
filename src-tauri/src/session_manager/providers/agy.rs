@@ -563,10 +563,27 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                     Some(call) => (call.id, Some(call.raw_name), call.subagent_type),
                     None => (format!("step-{step_index}-result"), None, None),
                 };
-                let content = value["content"].as_str().unwrap_or_default();
+                let content_value = &value["content"];
+                let content = match content_value {
+                    Value::String(text) => text.clone(),
+                    Value::Object(map) => map
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    Value::Array(items) => items
+                        .iter()
+                        .filter_map(|item| {
+                            item.as_str()
+                                .or_else(|| item.get("text").and_then(Value::as_str))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => String::new(),
+                };
                 let error = value["error"].as_str().unwrap_or_default();
                 if let Some(subagent_type) = pending_subagent_type {
-                    if let Some(conv_id) = extract_subagent_conversation_id(content) {
+                    if let Some(conv_id) = extract_subagent_conversation_id(&content) {
                         let label = if !subagent_type.is_empty() {
                             subagent_type
                         } else {
@@ -576,11 +593,18 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                     }
                 }
                 let (output, pointer) = if !content.trim().is_empty() {
-                    (content, "/content")
+                    (
+                        content.as_str(),
+                        if content_value.is_object() {
+                            "/content/text"
+                        } else {
+                            "/content"
+                        },
+                    )
                 } else if !error.trim().is_empty() {
                     (error, "/error")
                 } else {
-                    (content, "/content")
+                    (content.as_str(), "/content")
                 };
                 let exit_code = raw_name
                     .as_deref()
@@ -597,8 +621,10 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
                     ToolStatus::Interrupted
                 } else if status_str == "RUNNING" {
                     ToolStatus::Pending
-                } else {
+                } else if status_str == "DONE" {
                     ToolStatus::Success
+                } else {
+                    ToolStatus::Unknown
                 };
                 let mut block = blocks::tool_result_block(call_id, status, output, || {
                     Some(span.content_ref(pointer))
@@ -968,10 +994,16 @@ fn agy_tool_call(
                 ))
             };
             let counts = match args["ReplacementChunks"].as_array() {
-                Some(chunks) => chunks
-                    .iter()
-                    .filter_map(pair_counts)
-                    .reduce(|(a, r), (x, y)| (a.saturating_add(x), r.saturating_add(y))),
+                Some(chunks) if !chunks.is_empty() => {
+                    chunks
+                        .iter()
+                        .map(pair_counts)
+                        .try_fold((0u32, 0u32), |(a, r), counts| {
+                            let (x, y) = counts?;
+                            Some((a.saturating_add(x), r.saturating_add(y)))
+                        })
+                }
+                Some(_) => None,
                 None => pair_counts(args),
             };
             diff = counts.filter(|_| !path.is_empty()).map(|(added, removed)| {
@@ -2121,5 +2153,54 @@ mod tests {
             SessionBlock::ToolResult { exit_code, .. } => assert_eq!(*exit_code, Some(0)),
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+    #[test]
+    fn agy_preserves_structured_results_and_unknown_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("transcript_full.jsonl");
+        let long = "output line\n".repeat(300);
+        write_jsonl(
+            &file,
+            &[
+                json!({"step_index": 0, "type": "PLANNER_RESPONSE", "tool_calls": [
+                    {"id": "a", "name": "read_file", "args": {}},
+                    {"id": "b", "name": "read_file", "args": {}}
+                ]}),
+                json!({"step_index": 1, "type": "GENERIC", "status": "DONE", "content": {"text": long}}),
+                json!({"step_index": 2, "type": "GENERIC", "status": "NEW_STATE", "content": ["first", {"text": "second"}]}),
+            ],
+        );
+        let messages = load_messages(&file).unwrap();
+        let result = result_tuple(&messages[1]);
+        assert_eq!(result.1, ToolStatus::Success);
+        assert!(result.2);
+        let source = validated_source(&file, dir.path());
+        assert_eq!(
+            resolve_content_ref(&source, result.4.unwrap()).unwrap(),
+            long
+        );
+        let result = result_tuple(&messages[2]);
+        assert_eq!((result.1, result.3), (ToolStatus::Unknown, "first\nsecond"));
+    }
+
+    #[test]
+    fn agy_omits_incomplete_multi_edit_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("transcript_full.jsonl");
+        write_jsonl(
+            &file,
+            &[
+                json!({"step_index": 0, "type": "PLANNER_RESPONSE", "tool_calls": [
+                    {"id": "edit", "name": "multi_replace_file_content", "args": {
+                        "TargetFile": "/tmp/example", "ReplacementChunks": [
+                            {"TargetContent": "old", "ReplacementContent": "new"},
+                            {"TargetContent": "missing replacement"}
+                        ]
+                    }}
+                ]}),
+            ],
+        );
+        let messages = load_messages(&file).unwrap();
+        assert_eq!(call_tuple(&messages[0].blocks[0]).5, None);
     }
 }
