@@ -22,7 +22,11 @@ describe("TokenPlus description", () => {
       </I18nextProvider>,
     );
     expect(
-      screen.getByText(zh.providerForm.partnerPromotion.tokenplus),
+      screen.getByText(
+        (zh as typeof zh & {
+          providerForm: { partnerPromotion: { tokenplus: string } };
+        }).providerForm.partnerPromotion.tokenplus,
+      ),
     ).toBeVisible();
   });
 });

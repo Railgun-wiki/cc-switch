@@ -42,10 +42,10 @@ const requiredKeys = [
 type SettingsTranslations = Record<string, unknown>;
 
 const locales = [
-  ["en", en.settings],
-  ["ja", ja.settings],
-  ["zh", zh.settings],
-  ["zh-TW", zhTW.settings],
+  ["en", en],
+  ["ja", ja],
+  ["zh", zh],
+  ["zh-TW", zhTW],
 ] as const;
 
 function interpolationVariables(value: string): string[] {
@@ -72,12 +72,12 @@ describe("About tool management locale coverage", () => {
     "preserves interpolation variables in %s",
     (_locale, settings) => {
       for (const key of requiredKeys) {
-        const expected = en.settings[key];
+        const expected = (en as unknown as Record<string, unknown>)[key];
         const actual = (settings as SettingsTranslations)[key];
 
         expect(typeof actual).toBe("string");
         expect(interpolationVariables(actual as string)).toEqual(
-          interpolationVariables(expected),
+          interpolationVariables(expected as string),
         );
       }
     },

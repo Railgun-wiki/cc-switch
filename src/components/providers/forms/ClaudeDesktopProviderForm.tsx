@@ -393,7 +393,10 @@ export function ClaudeDesktopProviderForm({
             ? routesToRestore
             : undefined;
 
-        if (validRoutesToRestore && Object.keys(validRoutesToRestore).length > 0) {
+        if (
+          validRoutesToRestore &&
+          Object.keys(validRoutesToRestore).length > 0
+        ) {
           const restored = initialRouteRows(validRoutesToRestore);
           setProxyRoutes(normalizeProxyRows(restored));
         } else if (defaultProxyRouteRows.length > 0) {
@@ -1027,7 +1030,7 @@ export function ClaudeDesktopProviderForm({
       copilotSavedFixedDesktopRoutes:
         usesAutomaticCopilotFormat && copilotModelSelection === "fusion"
           ? (savedFixedProxyRoutes ??
-              initialData?.meta?.copilotSavedFixedDesktopRoutes)
+            initialData?.meta?.copilotSavedFixedDesktopRoutes)
           : undefined,
     };
 
@@ -1399,142 +1402,142 @@ export function ClaudeDesktopProviderForm({
                   ) : (
                     <div className="space-y-3">
                       <div className="space-y-1 border-t border-border pt-4">
-                      <div className="flex items-center justify-between">
-                        <Label>
-                          {t("claudeDesktop.routeMapTitle", {
-                            defaultValue: "模型映射",
+                        <div className="flex items-center justify-between">
+                          <Label>
+                            {t("claudeDesktop.routeMapTitle", {
+                              defaultValue: "模型映射",
+                            })}
+                          </Label>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={handleFetchModels}
+                            disabled={isFetchingModels}
+                            className="h-7 gap-1"
+                          >
+                            {isFetchingModels ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Download className="h-3.5 w-3.5" />
+                            )}
+                            {t("providerForm.fetchModels", {
+                              defaultValue: "获取模型",
+                            })}
+                          </Button>
+                        </div>
+                        <p className="text-xs leading-relaxed text-fg-2">
+                          {t("claudeDesktop.routeMapHint", {
+                            defaultValue:
+                              "为 Sonnet、Opus、Haiku 三档分别填写实际请求模型；菜单显示名可写 DeepSeek、Kimi 等品牌名。留空的档会自动沿用 Sonnet（或第一个已填档）的模型，确保子 agent 调用的 Haiku 始终可用。",
                           })}
-                        </Label>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={handleFetchModels}
-                          disabled={isFetchingModels}
-                          className="h-7 gap-1"
-                        >
-                          {isFetchingModels ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            <Download className="h-3.5 w-3.5" />
-                          )}
-                          {t("providerForm.fetchModels", {
-                            defaultValue: "获取模型",
-                          })}
-                        </Button>
+                        </p>
                       </div>
-                      <p className="text-xs leading-relaxed text-fg-2">
-                        {t("claudeDesktop.routeMapHint", {
-                          defaultValue:
-                            "为 Sonnet、Opus、Haiku 三档分别填写实际请求模型；菜单显示名可写 DeepSeek、Kimi 等品牌名。留空的档会自动沿用 Sonnet（或第一个已填档）的模型，确保子 agent 调用的 Haiku 始终可用。",
-                        })}
-                      </p>
-                    </div>
 
-                    <div className="hidden grid-cols-[140px_1fr_1fr_116px] gap-2 px-1 text-xs font-medium text-fg-2 md:grid">
-                      <span>
-                        {t("claudeDesktop.routeModelLabel", {
-                          defaultValue: "模型角色",
-                        })}
-                      </span>
-                      <span>
-                        {t("claudeDesktop.labelOverrideLabel", {
-                          defaultValue: "菜单显示名",
-                        })}
-                      </span>
-                      <span>
-                        {t("claudeDesktop.upstreamModelLabel", {
-                          defaultValue: "实际请求模型",
-                        })}
-                      </span>
-                      <span>
-                        {t("claudeDesktop.supports1mLabel", {
-                          defaultValue: "声明支持 1M",
-                        })}
-                      </span>
-                    </div>
-                    {routes.map((route, index) => {
-                      const role = routeRoleFromId(route.route);
-                      const roleLabel =
-                        role === "opus"
-                          ? t("claudeDesktop.routeRoleOpus", {
-                              defaultValue: "Opus",
-                            })
-                          : role === "haiku"
-                            ? t("claudeDesktop.routeRoleHaiku", {
-                                defaultValue: "Haiku",
+                      <div className="hidden grid-cols-[140px_1fr_1fr_116px] gap-2 px-1 text-xs font-medium text-fg-2 md:grid">
+                        <span>
+                          {t("claudeDesktop.routeModelLabel", {
+                            defaultValue: "模型角色",
+                          })}
+                        </span>
+                        <span>
+                          {t("claudeDesktop.labelOverrideLabel", {
+                            defaultValue: "菜单显示名",
+                          })}
+                        </span>
+                        <span>
+                          {t("claudeDesktop.upstreamModelLabel", {
+                            defaultValue: "实际请求模型",
+                          })}
+                        </span>
+                        <span>
+                          {t("claudeDesktop.supports1mLabel", {
+                            defaultValue: "声明支持 1M",
+                          })}
+                        </span>
+                      </div>
+                      {routes.map((route, index) => {
+                        const role = routeRoleFromId(route.route);
+                        const roleLabel =
+                          role === "opus"
+                            ? t("claudeDesktop.routeRoleOpus", {
+                                defaultValue: "Opus",
                               })
-                            : role === "fable"
-                              ? t("claudeDesktop.routeRoleFable", {
-                                  defaultValue: "Fable",
+                            : role === "haiku"
+                              ? t("claudeDesktop.routeRoleHaiku", {
+                                  defaultValue: "Haiku",
                                 })
-                              : t("claudeDesktop.routeRoleSonnet", {
-                                  defaultValue: "Sonnet",
-                                });
-                      // Haiku 档示范映射到轻量模型（flash），其余档映射到 pro；
-                      // 两列占位联动，保持每行「菜单显示名 ↔ 实际请求模型」品牌一致。
-                      const isHaikuRole = role === "haiku";
-                      const labelPlaceholder = isHaikuRole
-                        ? "DeepSeek V4 Flash"
-                        : "DeepSeek V4 Pro";
-                      const modelPlaceholder = isHaikuRole
-                        ? "deepseek-v4-flash"
-                        : "deepseek-v4-pro";
-                      return (
-                        <div
-                          key={route.rowId}
-                          className="grid grid-cols-1 gap-2 md:grid-cols-[140px_1fr_1fr_116px]"
-                        >
-                          <div className="flex h-9 items-center rounded-md border border-input bg-subtle px-3 text-sm font-medium text-fg-2">
-                            {roleLabel}
-                          </div>
-                          <Input
-                            value={route.labelOverride}
-                            onChange={(event) =>
-                              updateRoute(index, {
-                                labelOverride: event.target.value,
-                              })
-                            }
-                            placeholder={labelPlaceholder}
-                          />
-                          <div className="flex gap-1">
+                              : role === "fable"
+                                ? t("claudeDesktop.routeRoleFable", {
+                                    defaultValue: "Fable",
+                                  })
+                                : t("claudeDesktop.routeRoleSonnet", {
+                                    defaultValue: "Sonnet",
+                                  });
+                        // Haiku 档示范映射到轻量模型（flash），其余档映射到 pro；
+                        // 两列占位联动，保持每行「菜单显示名 ↔ 实际请求模型」品牌一致。
+                        const isHaikuRole = role === "haiku";
+                        const labelPlaceholder = isHaikuRole
+                          ? "DeepSeek V4 Flash"
+                          : "DeepSeek V4 Pro";
+                        const modelPlaceholder = isHaikuRole
+                          ? "deepseek-v4-flash"
+                          : "deepseek-v4-pro";
+                        return (
+                          <div
+                            key={route.rowId}
+                            className="grid grid-cols-1 gap-2 md:grid-cols-[140px_1fr_1fr_116px]"
+                          >
+                            <div className="flex h-9 items-center rounded-md border border-input bg-subtle px-3 text-sm font-medium text-fg-2">
+                              {roleLabel}
+                            </div>
                             <Input
-                              value={route.model}
+                              value={route.labelOverride}
                               onChange={(event) =>
-                                updateRouteModel(index, event.target.value)
+                                updateRoute(index, {
+                                  labelOverride: event.target.value,
+                                })
                               }
-                              placeholder={modelPlaceholder}
-                              className="flex-1"
+                              placeholder={labelPlaceholder}
                             />
-                            {fetchedModels.length > 0 && (
-                              <ModelDropdown
-                                models={fetchedModels}
-                                onSelect={(id) =>
-                                  updateRouteModel(index, id, true)
+                            <div className="flex gap-1">
+                              <Input
+                                value={route.model}
+                                onChange={(event) =>
+                                  updateRouteModel(index, event.target.value)
+                                }
+                                placeholder={modelPlaceholder}
+                                className="flex-1"
+                              />
+                              {fetchedModels.length > 0 && (
+                                <ModelDropdown
+                                  models={fetchedModels}
+                                  onSelect={(id) =>
+                                    updateRouteModel(index, id, true)
+                                  }
+                                />
+                              )}
+                            </div>
+                            <label className="flex h-9 items-center gap-2 text-sm text-fg-2">
+                              <Checkbox
+                                checked={route.supports1m}
+                                onCheckedChange={(checked) =>
+                                  updateRoute(index, {
+                                    supports1m: checked === true,
+                                  })
                                 }
                               />
-                            )}
+                              {t("claudeDesktop.supports1mShort", {
+                                defaultValue: "1M",
+                              })}
+                            </label>
                           </div>
-                          <label className="flex h-9 items-center gap-2 text-sm text-fg-2">
-                            <Checkbox
-                              checked={route.supports1m}
-                              onCheckedChange={(checked) =>
-                                updateRoute(index, {
-                                  supports1m: checked === true,
-                                })
-                              }
-                            />
-                            {t("claudeDesktop.supports1mShort", {
-                              defaultValue: "1M",
-                            })}
-                          </label>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {!needsModelMapping && (
                 <div className="space-y-3 border-t border-border pt-4">

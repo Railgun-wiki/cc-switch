@@ -774,9 +774,8 @@ mod tests {
 
     #[test]
     fn test_extract_prompt_summary_message_with_instruction_and_large_code_block() {
-        let large_code = "fn do_something() {\n".to_string()
-            + &"    println!(\"hello\");\n".repeat(300)
-            + "}";
+        let large_code =
+            "fn do_something() {\n".to_string() + &"    println!(\"hello\");\n".repeat(300) + "}";
         assert!(large_code.len() > 4000);
         let req = json!({
             "messages": [
@@ -801,9 +800,8 @@ mod tests {
 
     #[test]
     fn test_extract_prompt_summary_responses_message_with_instruction_and_large_code_block() {
-        let large_code = "fn do_something() {\n".to_string()
-            + &"    println!(\"hello\");\n".repeat(300)
-            + "}";
+        let large_code =
+            "fn do_something() {\n".to_string() + &"    println!(\"hello\");\n".repeat(300) + "}";
         assert!(large_code.len() > 4000);
         let req = json!({
             "input": [
@@ -817,8 +815,7 @@ mod tests {
                 }
             ]
         });
-        let (prompt, _) =
-            extract_prompt_summary_for_fusion(&req, RequestProtocol::CodexResponses);
+        let (prompt, _) = extract_prompt_summary_for_fusion(&req, RequestProtocol::CodexResponses);
         assert!(
             prompt.starts_with("请审查下面代码"),
             "Prompt must preserve user instruction at the start of the message, but was: {prompt}"

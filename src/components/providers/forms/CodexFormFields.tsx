@@ -2182,58 +2182,63 @@ export function CodexFormFields({
       <>
         {oauthSections}
         {copilotModelSelectionSelect}
-        {showFormatFields && !(isCopilotPreset && copilotModelSelection === "fusion") && upstreamFormatSelect}
+        {showFormatFields &&
+          !(isCopilotPreset && copilotModelSelection === "fusion") &&
+          upstreamFormatSelect}
         {apiKeySection}
         {showFormatFields && isAnthropicFormat && anthropicAuthFieldSelect}
         {endpointSection}
 
-        {canEditCatalog && !(isCopilotPreset && copilotModelSelection === "fusion") && (
-          <div className="space-y-3">
-            <div className="space-y-1">
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex items-center gap-0.5">
-                  <FormLabel>
-                    {t("codexConfig.modelListTitle", {
-                      defaultValue: "模型列表",
-                    })}
-                  </FormLabel>
-                  <HelpTip
-                    title={t("codexConfig.modelListTitle", {
-                      defaultValue: "模型列表",
-                    })}
-                  >
-                    {t("codexConfig.stackModelDefaultHelp", {
-                      defaultValue:
-                        "这些模型会出现在 Codex 的 /model 里，选中后请求直达这家。第一行是默认模型：这家被设为默认时，Codex 默认用它。",
-                    })}
-                  </HelpTip>
+        {canEditCatalog &&
+          !(isCopilotPreset && copilotModelSelection === "fusion") && (
+            <div className="space-y-3">
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-0.5">
+                    <FormLabel>
+                      {t("codexConfig.modelListTitle", {
+                        defaultValue: "模型列表",
+                      })}
+                    </FormLabel>
+                    <HelpTip
+                      title={t("codexConfig.modelListTitle", {
+                        defaultValue: "模型列表",
+                      })}
+                    >
+                      {t("codexConfig.stackModelDefaultHelp", {
+                        defaultValue:
+                          "这些模型会出现在 Codex 的 /model 里，选中后请求直达这家。第一行是默认模型：这家被设为默认时，Codex 默认用它。",
+                      })}
+                    </HelpTip>
+                  </div>
+                  {renderCatalogActionButtons(
+                    handleAddCatalogRow,
+                    t("codexConfig.addCatalogModel", {
+                      defaultValue: "手动添加",
+                    }),
+                  )}
                 </div>
-                {renderCatalogActionButtons(
-                  handleAddCatalogRow,
-                  t("codexConfig.addCatalogModel", {
-                    defaultValue: "手动添加",
-                  }),
-                )}
+                <p className="text-xs leading-relaxed text-fg-2">
+                  {t("codexConfig.modelListHint", {
+                    defaultValue: "修改后需要重启 Codex。",
+                  })}
+                </p>
               </div>
-              <p className="text-xs leading-relaxed text-fg-2">
-                {t("codexConfig.modelListHint", {
-                  defaultValue: "修改后需要重启 Codex。",
-                })}
-              </p>
+              {defaultModelNotInListNotice}
+              {catalogRows.length > 0 ? (
+                renderCatalogRows()
+              ) : (
+                <p className="text-xs leading-relaxed text-fg-2">
+                  {t("codexConfig.modelListEmpty", {
+                    defaultValue:
+                      "未配置模型：聚合模式下只发布下面的默认模型。",
+                  })}
+                </p>
+              )}
             </div>
-            {defaultModelNotInListNotice}
-            {catalogRows.length > 0 ? (
-              renderCatalogRows()
-            ) : (
-              <p className="text-xs leading-relaxed text-fg-2">
-                {t("codexConfig.modelListEmpty", {
-                  defaultValue: "未配置模型：聚合模式下只发布下面的默认模型。",
-                })}
-              </p>
-            )}
-          </div>
-        )}
-        {!(isCopilotPreset && copilotModelSelection === "fusion") && defaultModelField}
+          )}
+        {!(isCopilotPreset && copilotModelSelection === "fusion") &&
+          defaultModelField}
 
         {hasStackAdvancedContent && (
           <Collapsible
@@ -2312,48 +2317,50 @@ export function CodexFormFields({
 
       {/* 模型列表 —— 生成 Codex 的模型目录（model_catalog_json）：/model 菜单列哪些模型，
           各自的窗口和思考等级。留空不生成。第一行是默认模型，子代理也从这里选。 */}
-      {firstRowIsDefault && !(isCopilotPreset && copilotModelSelection === "fusion") && (
-        <div className="space-y-3">
-          <div className="space-y-1">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex items-center gap-0.5">
-                <FormLabel>
-                  {t("codexConfig.modelListTitle", {
-                    defaultValue: "模型列表",
-                  })}
-                </FormLabel>
-                <HelpTip
-                  title={t("codexConfig.modelListTitle", {
-                    defaultValue: "模型列表",
-                  })}
-                >
-                  {t("codexConfig.modelListDefaultHelp", {
-                    defaultValue:
-                      "这些模型会出现在 Codex 的 /model 里，第一行是默认模型。名字是官方 GPT 模型的行按官方条目生成，行里的显示名、窗口和思考等级不生效。",
-                  })}
-                </HelpTip>
+      {firstRowIsDefault &&
+        !(isCopilotPreset && copilotModelSelection === "fusion") && (
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-0.5">
+                  <FormLabel>
+                    {t("codexConfig.modelListTitle", {
+                      defaultValue: "模型列表",
+                    })}
+                  </FormLabel>
+                  <HelpTip
+                    title={t("codexConfig.modelListTitle", {
+                      defaultValue: "模型列表",
+                    })}
+                  >
+                    {t("codexConfig.modelListDefaultHelp", {
+                      defaultValue:
+                        "这些模型会出现在 Codex 的 /model 里，第一行是默认模型。名字是官方 GPT 模型的行按官方条目生成，行里的显示名、窗口和思考等级不生效。",
+                    })}
+                  </HelpTip>
+                </div>
+                {renderCatalogActionButtons(
+                  handleAddCatalogRow,
+                  t("codexConfig.addCatalogModel", {
+                    defaultValue: "手动添加",
+                  }),
+                )}
               </div>
-              {renderCatalogActionButtons(
-                handleAddCatalogRow,
-                t("codexConfig.addCatalogModel", {
-                  defaultValue: "手动添加",
-                }),
-              )}
+              <p className="text-xs leading-relaxed text-fg-2">
+                {t("codexConfig.modelListHint", {
+                  defaultValue: "修改后需要重启 Codex。",
+                })}
+              </p>
             </div>
-            <p className="text-xs leading-relaxed text-fg-2">
-              {t("codexConfig.modelListHint", {
-                defaultValue: "修改后需要重启 Codex。",
-              })}
-            </p>
-          </div>
 
-          {defaultModelNotInListNotice}
-          {catalogRows.length > 0 && renderCatalogRows()}
-        </div>
-      )}
+            {defaultModelNotInListNotice}
+            {catalogRows.length > 0 && renderCatalogRows()}
+          </div>
+        )}
 
       {/* 默认模型：列表为空（或没有列表）时才显示 */}
-      {!(isCopilotPreset && copilotModelSelection === "fusion") && defaultModelField}
+      {!(isCopilotPreset && copilotModelSelection === "fusion") &&
+        defaultModelField}
 
       {/* 子代理 —— config.toml 的 [agents] default_subagent_model / default_subagent_reasoning_effort。
           留空删键，子代理跟随主模型；聚合模式下不写进 live（改用聚合设置）。 */}
@@ -2547,15 +2554,15 @@ export function CodexFormFields({
             {(shouldShowSpeedTest || isCopilotPreset) &&
               !isXaiOauthPreset &&
               !(isCopilotPreset && copilotModelSelection === "fusion") && (
-              <div className="space-y-3">
-                {upstreamFormatSelect}
-                {officialSpeedTiersToggle}
-                {isAnthropicFormat && anthropicAuthFieldSelect}
-                {isAnthropicFormat && impersonateClaudeCodeToggle}
-                {isAnthropicFormat && maxOutputTokensField}
-                {showFullUrlToggle && fullUrlToggle}
-              </div>
-            )}
+                <div className="space-y-3">
+                  {upstreamFormatSelect}
+                  {officialSpeedTiersToggle}
+                  {isAnthropicFormat && anthropicAuthFieldSelect}
+                  {isAnthropicFormat && impersonateClaudeCodeToggle}
+                  {isAnthropicFormat && maxOutputTokensField}
+                  {showFullUrlToggle && fullUrlToggle}
+                </div>
+              )}
 
             {isChatFormat && canEditReasoning && (
               <div
