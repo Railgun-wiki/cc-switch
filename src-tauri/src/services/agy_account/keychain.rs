@@ -11,11 +11,13 @@
 //! 认账号的办法见 `AgyAccountManager::read_live`。旧格式 agy 1.5 照样能读（切过去的号 agy
 //! 续期后会改写成新格式），这里不转换，原样读写。
 //!
-//! 只做切换要用的两件事：读出整条、整条写入。不删除条目，也不碰 `~/.gemini` 下的文件
-//! （`oauth_creds.json` 那些是 Gemini CLI 的登录，agy 1.4.3 切号只看钥匙串）。
+//! CLI 只读写钥匙串里的整条凭据。Desktop 在钥匙串没有凭据或不可用时还会读取
+//! `~/.gemini/jetski-standalone-oauth-token`。
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::error::AppError;
 
@@ -24,7 +26,7 @@ mod linux;
 
 const GO_KEYRING_PREFIX: &str = "go-keyring-base64:";
 
-/// 钥匙串里那一条的读写。测试换成内存实现，别碰真实钥匙串。
+/// Antigravity 原生登录的读写。测试可用独立凭据存储。
 pub trait AgyLoginStore: Send + Sync {
     /// 当前登录的原始值；没登录（条目不存在）时为 `None`。
     fn read(&self) -> Result<Option<String>, AppError>;
@@ -34,6 +36,79 @@ pub trait AgyLoginStore: Send + Sync {
     }
     /// 整条覆盖写入（条目不存在时新建）。
     fn write(&self, value: &str) -> Result<(), AppError>;
+    fn write_credential(&self, credential: &Value) -> Result<(), AppError> {
+        self.write(&encode(credential)?)
+    }
+}
+
+/// Desktop's standalone language server checks the keychain first, then this file.
+pub(super) struct DesktopLogin {
+    keychain: Arc<dyn AgyLoginStore>,
+    file: PathBuf,
+}
+
+impl DesktopLogin {
+    pub(super) fn new(file: PathBuf) -> Self {
+        Self {
+            keychain: Arc::new(SystemKeychain {
+                #[cfg(target_os = "linux")]
+                default_collection: true,
+                ..SystemKeychain::agy()
+            }),
+            file,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_keychain(file: PathBuf, keychain: Arc<dyn AgyLoginStore>) -> Self {
+        Self { keychain, file }
+    }
+
+    fn read_file(&self) -> Result<Option<String>, AppError> {
+        match std::fs::read_to_string(&self.file) {
+            Ok(raw) => Ok(Some(raw)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(AppError::io(&self.file, error)),
+        }
+    }
+}
+
+impl AgyLoginStore for DesktopLogin {
+    fn read(&self) -> Result<Option<String>, AppError> {
+        match self.keychain.read() {
+            Ok(Some(raw)) => Ok(Some(raw)),
+            _ => self.read_file(),
+        }
+    }
+
+    fn read_for_switch(&self) -> Result<Option<String>, AppError> {
+        match self.keychain.read_for_switch() {
+            Ok(Some(raw)) => Ok(Some(raw)),
+            _ => self.read_file(),
+        }
+    }
+
+    fn write(&self, raw: &str) -> Result<(), AppError> {
+        self.write_credential(&decode(raw)?)
+    }
+
+    fn write_credential(&self, credential: &Value) -> Result<(), AppError> {
+        match self.keychain.read_for_switch() {
+            // If the existing keychain entry is readable, writing the file would leave it
+            // shadowed. Report a failed keychain write instead.
+            Ok(Some(_)) => return self.keychain.write_credential(credential),
+            Ok(None)
+                if self.read_file()?.is_none()
+                    && self.keychain.write_credential(credential).is_ok() =>
+            {
+                return Ok(());
+            }
+            _ => {}
+        }
+        let raw =
+            serde_json::to_vec(credential).map_err(|source| AppError::JsonSerialize { source })?;
+        crate::config::atomic_write_private(&self.file, &raw)
+    }
 }
 
 /// 按 go-keyring 的格式解出登录 JSON；没有前缀的当成裸 JSON（Windows / Linux 上就是这样存的）。
@@ -121,6 +196,8 @@ fn encode_bare(credential: &Value) -> Result<String, AppError> {
 pub struct SystemKeychain {
     service: &'static str,
     account: &'static str,
+    #[cfg(target_os = "linux")]
+    default_collection: bool,
 }
 
 impl SystemKeychain {
@@ -129,6 +206,8 @@ impl SystemKeychain {
         Self {
             service: "gemini",
             account: "antigravity",
+            #[cfg(target_os = "linux")]
+            default_collection: false,
         }
     }
 
@@ -342,7 +421,7 @@ impl AgyLoginStore for SystemKeychain {
         }
         #[cfg(target_os = "linux")]
         {
-            linux::read(self.service, self.account, false)
+            linux::read(self.service, self.account, false, self.default_collection)
         }
         #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
         {
@@ -352,7 +431,7 @@ impl AgyLoginStore for SystemKeychain {
 
     #[cfg(target_os = "linux")]
     fn read_for_switch(&self) -> Result<Option<String>, AppError> {
-        linux::read(self.service, self.account, true)
+        linux::read(self.service, self.account, true, self.default_collection)
     }
 
     fn write(&self, value: &str) -> Result<(), AppError> {
@@ -366,7 +445,7 @@ impl AgyLoginStore for SystemKeychain {
         }
         #[cfg(target_os = "linux")]
         {
-            linux::write(self.service, self.account, value)
+            linux::write(self.service, self.account, value, self.default_collection)
         }
         #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
         {

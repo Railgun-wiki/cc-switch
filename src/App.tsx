@@ -11,6 +11,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { toast } from "@/lib/toast";
 import { invoke } from "@tauri-apps/api/core";
+import { canSwitchAgyAccount } from "@/lib/authBinding";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   ExternalLink,
@@ -1561,7 +1562,6 @@ function App() {
             </Button>
           )}
           {currentView === "providers" &&
-            activeApp !== "agy-desktop" &&
             (settingsData?.showProviderSearch ?? true) && (
               <HoverTip
                 content={t("provider.searchButtonTip", {
@@ -1580,16 +1580,17 @@ function App() {
                 </Button>
               </HoverTip>
             )}
-          {currentView === "providers" && activeApp !== "agy-desktop" && (
-            <Button
-              variant="solid"
-              size="regular"
-              onClick={() => openAddProvider(currentModeView)}
-            >
-              <Plus className="h-4 w-4" />
-              {t("provider.addProvider")}
-            </Button>
-          )}
+          {currentView === "providers" &&
+            (activeApp !== "agy-desktop" || canSwitchAgyAccount()) && (
+              <Button
+                variant="solid"
+                size="regular"
+                onClick={() => openAddProvider(currentModeView)}
+              >
+                <Plus className="h-4 w-4" />
+                {t("provider.addProvider")}
+              </Button>
+            )}
           {currentView === "hermesMemory" && (
             <Suspense fallback={null}>
               <HermesMemorySaveButton />
@@ -1665,11 +1666,13 @@ function App() {
     if (activeApp === "agy-desktop") {
       return (
         <AgyDesktopPanel
-          onOpenPage={openPage}
-          onOpenUsage={() => {
-            setUsageAppFilter("agy");
-            openPage("usage");
-          }}
+          savedProviders={providers}
+          scrollRef={providerScrollContainerRef}
+          onCreate={
+            canSwitchAgyAccount() ? () => openAddProvider(undefined) : undefined
+          }
+          searchOpen={providerSearchOpen}
+          onSearchOpenChange={setProviderSearchOpen}
         />
       );
     }

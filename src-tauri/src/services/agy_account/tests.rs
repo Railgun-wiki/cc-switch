@@ -10,10 +10,14 @@ struct MemoryLogin {
     value: StdMutex<Option<String>>,
     writes: StdMutex<usize>,
     locked: StdMutex<bool>,
+    unavailable: StdMutex<bool>,
 }
 
 impl AgyLoginStore for MemoryLogin {
     fn read(&self) -> Result<Option<String>, AppError> {
+        if *self.unavailable.lock().unwrap() {
+            return Err(AppError::Config("test keychain is unavailable".into()));
+        }
         if *self.locked.lock().unwrap() {
             return Err(AppError::Config("test keychain is locked".into()));
         }
@@ -75,6 +79,73 @@ async fn add(manager: &AgyAccountManager, sub: &str) {
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 mod switching {
     use super::*;
+
+    #[tokio::test]
+    async fn desktop_collects_and_switches_the_standalone_file_without_changing_cli_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DESKTOP_TOKEN_FILENAME);
+        std::fs::write(&path, credential("alice", "desktop").to_string()).unwrap();
+        let cli = Arc::new(MemoryLogin::default());
+        set_live(&cli, &credential("cli", "cli"));
+        let desktop_keychain = Arc::new(MemoryLogin::default());
+        *desktop_keychain.unavailable.lock().unwrap() = true;
+        let desktop = Arc::new(keychain::DesktopLogin::with_keychain(
+            path.clone(),
+            desktop_keychain.clone(),
+        ));
+        let manager =
+            AgyAccountManager::with_login_stores(dir.path().to_path_buf(), cli.clone(), desktop);
+        add(&manager, "bob").await;
+        assert_eq!(
+            manager
+                .status_for(true)
+                .await
+                .unwrap()
+                .current_account_id
+                .as_deref(),
+            Some("alice")
+        );
+        manager.switch_to_for("bob", true).await.unwrap();
+        assert_eq!(
+            manager
+                .status_for(true)
+                .await
+                .unwrap()
+                .current_account_id
+                .as_deref(),
+            Some("bob")
+        );
+        assert_eq!(live_sub(&cli).as_deref(), Some("cli"));
+        assert_eq!(*desktop_keychain.writes.lock().unwrap(), 0);
+        let stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(refresh_token_of(&stored), Some("refresh-bob"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        manager.switch_to_for("alice", true).await.unwrap();
+        assert_eq!(
+            manager
+                .status_for(true)
+                .await
+                .unwrap()
+                .current_account_id
+                .as_deref(),
+            Some("alice")
+        );
+
+        // When a keychain login exists, it takes precedence over the fallback file.
+        *desktop_keychain.unavailable.lock().unwrap() = false;
+        set_live(&desktop_keychain, &credential("keychain", "primary"));
+        manager.switch_to_for("bob", true).await.unwrap();
+        assert_eq!(live_sub(&desktop_keychain).as_deref(), Some("bob"));
+        let stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(refresh_token_of(&stored), Some("refresh-alice"));
+    }
 
     #[tokio::test]
     async fn status_collects_the_login_agy_already_has() {
