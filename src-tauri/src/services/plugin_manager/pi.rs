@@ -346,14 +346,20 @@ fn strip_ansi(text: &str) -> String {
 
 /// `pi list` 的 user 段：`[(来源, 安装目录)]`。
 ///
+/// 合法输出要么是 `No packages installed.`，要么包含 `User packages:` / `Project packages:` 段。
+/// 如果命令退出码为 0 却输出了无关内容（例如命中了同名 `pnpm` / 包装脚本的 `Legend: ... 0 packages`），
+/// 报错而不是静默当成「已安装 0 个」，避免用户继续在「发现」页点安装把 `~/.pi/agent`
+/// 当成普通项目目录往里装依赖（#9960）。
+///
 /// ```text
 /// User packages:
 ///   npm:@scope/tools
 ///     /home/me/.pi/agent/npm/node_modules/@scope/tools
 ///   ./local-pkg (filtered)
 /// ```
-fn parse_list_output(stdout: &str) -> Vec<(String, Option<String>)> {
+fn parse_list_output(stdout: &str) -> Result<Vec<(String, Option<String>)>, String> {
     let text = strip_ansi(stdout);
+    let mut recognized = false;
     let mut in_user = false;
     let mut packages: Vec<(String, Option<String>)> = Vec::new();
     for line in text.lines() {
@@ -364,7 +370,15 @@ fn parse_list_output(stdout: &str) -> Vec<(String, Option<String>)> {
         let indent = trimmed.len() - trimmed.trim_start().len();
         let content = trimmed.trim_start();
         if indent == 0 {
-            in_user = content == "User packages:";
+            if content == "User packages:" {
+                recognized = true;
+                in_user = true;
+            } else if content == "Project packages:" || content == "No packages installed." {
+                recognized = true;
+                in_user = false;
+            } else {
+                in_user = false;
+            }
             continue;
         }
         if !in_user {
@@ -381,7 +395,24 @@ fn parse_list_output(stdout: &str) -> Vec<(String, Option<String>)> {
             packages.push((source.to_string(), None));
         }
     }
-    packages
+    if !recognized {
+        let preview = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| {
+                let mut truncated: String = line.chars().take(160).collect();
+                if line.chars().count() > 160 {
+                    truncated.push('…');
+                }
+                truncated
+            })
+            .unwrap_or_else(|| "<empty>".to_string());
+        return Err(format!(
+            "Unexpected output from `pi list` (the resolved `pi` command may not be Pi coding agent): {preview}"
+        ));
+    }
+    Ok(packages)
 }
 
 #[derive(Default)]
@@ -406,15 +437,22 @@ fn read_package_manifest(dir: &Path) -> PackageManifest {
 fn installed_entries(
     listed: Vec<(String, Option<String>)>,
     settings_packages: &[Value],
+    wsl_root: Option<&Path>,
 ) -> Vec<PluginEntry> {
     listed
         .into_iter()
         .map(|(source, install_path)| {
             let manifest = install_path
                 .as_deref()
-                .map(|p| read_package_manifest(Path::new(p)))
+                .and_then(|p| super::resolve_cli_path(p, wsl_root))
+                .map(|p| read_package_manifest(&p))
                 .unwrap_or_default();
             let enabled = !find_package(settings_packages, &source).is_some_and(is_disabled);
+            // 钉了版本的 npm 包（`npm:x@1.2.3`）对应目录里的 `npm:x`；卸掉再从「发现」安装时
+            // 目录保持无状态，不会残留旧的固定版本 id。
+            let catalog_id = npm_package_name(&source)
+                .map(|pkg| format!("npm:{pkg}"))
+                .filter(|canonical| canonical != &source);
             // 都给卸载、更新入口：交不给 CLI 的远程来源（`npm:x@^1`）点了会提示去终端里做，
             // 标成不可卸载的话前端会显示成「内置」，更误导
             PluginEntry {
@@ -427,6 +465,7 @@ fn installed_entries(
                 manageable: true,
                 removable: true,
                 installable: true,
+                catalog_id,
                 install_path,
                 id: source,
                 ..Default::default()
@@ -440,10 +479,15 @@ pub(super) fn list_installed() -> Result<Vec<PluginEntry>, String> {
     if !out.success {
         return Err(super::failure_detail(&out));
     }
-    let listed = parse_list_output(&out.stdout);
+    let listed = parse_list_output(&out.stdout)?;
     // CLI 刚读过同一份文件；这里读不了只影响开关状态的显示
     let settings_packages = read_settings_packages().unwrap_or_default();
-    Ok(installed_entries(listed, &settings_packages))
+    let wsl_root = super::wsl_root_for_app(super::PluginApp::Pi);
+    Ok(installed_entries(
+        listed,
+        &settings_packages,
+        wsl_root.as_deref(),
+    ))
 }
 
 /// `pi update <source>` 真的更新时会先打印 `Updating <source>...`；已是最新只有 `Updated …`。
@@ -490,21 +534,6 @@ fn parse_search_page(value: &Value) -> (Vec<(String, PluginEntry)>, usize) {
     (entries, total)
 }
 
-/// 已经按别的写法装过（钉了版本 `npm:x@1.2.3`）的，目录条目指向那个来源，「发现」里不再列。
-fn link_installed_sources(catalog: &mut [PluginEntry], settings_packages: &[Value]) {
-    for entry in catalog.iter_mut() {
-        let configured = settings_packages
-            .iter()
-            .filter_map(package_source)
-            .find(|source| npm_package_name(source) == Some(entry.name.as_str()));
-        if let Some(source) = configured {
-            if source != entry.id {
-                entry.installed_id = Some(source.to_string());
-            }
-        }
-    }
-}
-
 async fn fetch_catalog() -> Result<Vec<PluginEntry>, String> {
     let client = crate::proxy::http_client::get_for_url(REGISTRY_SEARCH_URL);
     let mut seen = std::collections::HashSet::new();
@@ -544,10 +573,7 @@ async fn fetch_catalog() -> Result<Vec<PluginEntry>, String> {
 }
 
 pub(super) fn list_catalog() -> Result<Vec<PluginEntry>, String> {
-    let mut catalog = tauri::async_runtime::block_on(fetch_catalog())?;
-    let settings_packages = read_settings_packages().unwrap_or_default();
-    link_installed_sources(&mut catalog, &settings_packages);
-    Ok(catalog)
+    tauri::async_runtime::block_on(fetch_catalog())
 }
 
 #[cfg(test)]
@@ -610,7 +636,7 @@ mod tests {
     fn list_output_reads_user_section_only() {
         let stdout = "\u{1b}[1mUser packages:\u{1b}[22m\n  npm:@scope/tools\n\u{1b}[2m    /home/me/.pi/agent/npm/node_modules/@scope/tools\u{1b}[22m\n  ./local-pkg (filtered)\n  git:github.com/o/missing\n\nProject packages:\n  npm:project-only\n    /work/.pi/npm/node_modules/project-only\n";
         assert_eq!(
-            parse_list_output(stdout),
+            parse_list_output(stdout).unwrap(),
             vec![
                 (
                     "npm:@scope/tools".to_string(),
@@ -620,7 +646,19 @@ mod tests {
                 ("git:github.com/o/missing".to_string(), None),
             ]
         );
-        assert!(parse_list_output("No packages installed.\n").is_empty());
+        assert!(parse_list_output("No packages installed.\n")
+            .unwrap()
+            .is_empty());
+        assert!(parse_list_output("Project packages:\n  npm:project-only\n")
+            .unwrap()
+            .is_empty());
+        let err = parse_list_output(
+            "Legend: production dependency, optional only, dev only\n\n/Users/me/.pi/agent\n\n0 packages\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("Unexpected output from `pi list`"), "{err}");
+        assert!(err.contains("Legend: production dependency"), "{err}");
+        assert!(parse_list_output("").is_err());
     }
 
     #[test]
@@ -646,18 +684,47 @@ mod tests {
                 ("npm:x@^1".into(), None),
             ],
             &settings,
+            None,
         );
         let tools = &entries[0];
         assert_eq!(tools.name, "@scope/tools");
         assert_eq!(tools.version.as_deref(), Some("1.4.0"));
         assert_eq!(tools.description.as_deref(), Some("Handy tools"));
+        assert_eq!(tools.catalog_id, None, "unpinned npm matches catalog id");
         assert!(tools.enabled && tools.removable && tools.manageable);
         let off = &entries[1];
         assert_eq!(off.name, "off");
+        assert_eq!(off.catalog_id, None);
         assert!(!off.enabled, "all resources filtered out");
         let ranged = &entries[2];
+        assert_eq!(ranged.catalog_id.as_deref(), Some("npm:x"));
         assert!(ranged.enabled, "a partial filter still loads the package");
         assert!(ranged.removable);
+    }
+
+    #[test]
+    fn installed_entries_read_package_manifest_under_wsl_root() {
+        let fake_wsl = tempfile::tempdir().unwrap();
+        let pkg_dir = fake_wsl
+            .path()
+            .join("home/me/.pi/agent/npm/node_modules/@scope/tools");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{"name":"@scope/tools","version":"2.3.4","description":"WSL Pi package"}"#,
+        )
+        .unwrap();
+        let entries = installed_entries(
+            vec![(
+                "npm:@scope/tools".into(),
+                Some("/home/me/.pi/agent/npm/node_modules/@scope/tools".into()),
+            )],
+            &[json!("npm:@scope/tools")],
+            Some(fake_wsl.path()),
+        );
+        assert_eq!(entries[0].name, "@scope/tools");
+        assert_eq!(entries[0].version.as_deref(), Some("2.3.4"));
+        assert_eq!(entries[0].description.as_deref(), Some("WSL Pi package"));
     }
 
     #[test]
@@ -726,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn search_page_and_installed_links() {
+    fn search_page_is_stateless_and_pinned_installed_entries_link_to_catalog() {
         let value = json!({
             "total": 3,
             "objects": [
@@ -737,20 +804,25 @@ mod tests {
         });
         let (page, total) = parse_search_page(&value);
         assert_eq!(total, 3);
-        let mut catalog: Vec<PluginEntry> = page.into_iter().map(|(_, e)| e).collect();
+        let catalog: Vec<PluginEntry> = page.into_iter().map(|(_, e)| e).collect();
         assert_eq!(catalog.len(), 2);
         assert_eq!(catalog[0].id, "npm:@scope/tools");
+        assert_eq!(catalog[0].installed_id, None);
+        assert_eq!(catalog[1].installed_id, None);
         assert!(catalog[0].installable && !catalog[0].installed);
 
-        link_installed_sources(
-            &mut catalog,
-            &[
-                json!("npm:@scope/tools"),
-                json!({"source": "npm:pinned@1.0.0"}),
+        let installed = installed_entries(
+            vec![
+                ("npm:@scope/tools".into(), None),
+                ("npm:pinned@1.0.0".into(), None),
+                ("git:github.com/o/pinned".into(), None),
             ],
+            &[],
+            None,
         );
-        assert_eq!(catalog[0].installed_id, None, "same source");
-        assert_eq!(catalog[1].installed_id.as_deref(), Some("npm:pinned@1.0.0"));
+        assert_eq!(installed[0].catalog_id, None, "same source");
+        assert_eq!(installed[1].catalog_id.as_deref(), Some("npm:pinned"));
+        assert_eq!(installed[2].catalog_id, None, "git does not link to npm");
     }
 
     #[test]
